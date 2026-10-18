@@ -39,7 +39,50 @@ function glowTexture(): THREE.Texture {
   return t;
 }
 
-export function buildLighthouse(kit: Kit, col: Collision, glass: THREE.Material): Lighthouse {
+/** The stair bridge and the gallery rail, shared by the meshes and the colliders. */
+function lighthouseFrame() {
+  const bridgeDir = new THREE.Vector2(L.bridgeFrom[0] - L.x, L.bridgeFrom[1] - L.z).normalize();
+  const gapAng = Math.atan2(bridgeDir.y, bridgeDir.x);
+  const gapHalf = 0.36;
+  const railR = 4.8;
+  const arc = Math.PI * 2 - gapHalf * 2;
+  const p0 = new THREE.Vector3(L.bridgeFrom[0], HEADLAND_H, L.bridgeFrom[1]);
+  const p1 = new THREE.Vector3(L.x + bridgeDir.x * (L.galleryOuter + 0.1), L.galleryY, L.z + bridgeDir.y * (L.galleryOuter + 0.1));
+  const d = new THREE.Vector2(p1.x - p0.x, p1.z - p0.z);
+  const len = d.length();
+  d.normalize();
+  const yaw = Math.atan2(-d.y, d.x);
+  const rise = p1.y - p0.y;
+  const W = 3.2;
+  const mid = p0.clone().lerp(p1, 0.5);
+  const nx = -d.y;
+  const nz = d.x;
+  return { gapAng, gapHalf, railR, arc, p0, p1, d, len, yaw, rise, W, mid, nx, nz };
+}
+
+/** Bridge deck, parapets, gallery ring, lantern drum and outer rail. */
+export function registerLighthouse(col: Collision): void {
+  const { gapAng, gapHalf, railR, arc, p0, p1, d, len, yaw, rise, W, mid, nx, nz } = lighthouseFrame();
+  col.addSurface(rectSurface(mid.x, mid.z, len / 2 + 0.6, W / 2 - 0.2, yaw, mid.y, rise / len, 0));
+  for (const side of [-1, 1]) {
+    const ox = nx * side * (W / 2 - 0.1);
+    const oz = nz * side * (W / 2 - 0.1);
+    col.addWall(p0.x + ox - d.x * 0.6, p0.z + oz - d.y * 0.6, p1.x + ox - d.x * 0.2, p1.z + oz - d.y * 0.2, 0.3);
+  }
+  col.addSurface(annulusSurface(L.x, L.z, L.lanternRadius - 0.1, L.galleryOuter + 0.15, L.galleryY));
+  col.addCircle(L.x, L.z, L.lanternRadius + 0.15, L.galleryY - 1, L.galleryY + 8);
+  const segs = 28;
+  for (let i = 0; i < segs; i++) {
+    const a0 = gapAng + gapHalf + (i / segs) * arc;
+    const a1 = gapAng + gapHalf + ((i + 1) / segs) * arc;
+    col.addWall(L.x + Math.cos(a0) * railR, L.z + Math.sin(a0) * railR, L.x + Math.cos(a1) * railR, L.z + Math.sin(a1) * railR, 0.25, L.galleryY - 0.5, L.galleryY + 1.2);
+  }
+  // The tower blocks line of sight below the gallery.
+  col.addCircle(L.x, L.z, 3.8, L.stackTop - 3, L.galleryY - 0.6, true);
+}
+
+export function buildLighthouse(kit: Kit, glass: THREE.Material): Lighthouse {
+  const frame = lighthouseFrame();
   const group = new THREE.Group();
   group.name = 'lighthouse';
   const base = new THREE.Vector3(L.x, L.stackTop, L.z);
@@ -144,11 +187,7 @@ export function buildLighthouse(kit: Kit, col: Collision, glass: THREE.Material)
   }
   ironParts.push(new THREE.TorusGeometry(2.03, 0.07, 6, 40).rotateX(Math.PI / 2).translate(0, G + 0.9, 0));
   ironParts.push(new THREE.TorusGeometry(2.03, 0.07, 6, 40).rotateX(Math.PI / 2).translate(0, G + 3.72, 0));
-  const bridgeDir = new THREE.Vector2(L.bridgeFrom[0] - L.x, L.bridgeFrom[1] - L.z).normalize();
-  const gapAng = Math.atan2(bridgeDir.y, bridgeDir.x);
-  const gapHalf = 0.36;
-  const railR = 4.8;
-  const arc = Math.PI * 2 - gapHalf * 2;
+  const { gapAng, gapHalf, railR, arc } = frame;
   for (const h of [0.55, 1.05]) {
     const t = new THREE.TorusGeometry(railR, h > 1 ? 0.06 : 0.04, 6, 64, arc).rotateX(Math.PI / 2);
     // Torus starts at +x and runs toward -z after rotateX(+pi/2); rotate to start after the gap.
@@ -221,17 +260,9 @@ export function buildLighthouse(kit: Kit, col: Collision, glass: THREE.Material)
   group.add(wb);
 
   // Stair bridge from the headland to the gallery.
-  const p0 = new THREE.Vector3(L.bridgeFrom[0], HEADLAND_H, L.bridgeFrom[1]);
-  const p1 = new THREE.Vector3(L.x + bridgeDir.x * (L.galleryOuter + 0.1), L.galleryY, L.z + bridgeDir.y * (L.galleryOuter + 0.1));
-  const d = new THREE.Vector2(p1.x - p0.x, p1.z - p0.z);
-  const len = d.length();
-  d.normalize();
-  const yaw = Math.atan2(-d.y, d.x);
-  const rise = p1.y - p0.y;
+  const { p0, p1, len, yaw, rise, W, mid, nx, nz } = frame;
   const steps = Math.round(rise / 0.22);
   const bridgeParts: THREE.BufferGeometry[] = [];
-  const W = 3.2;
-  const mid = p0.clone().lerp(p1, 0.5);
   const slope = Math.atan2(rise, len);
   // Sloped soffit slab.
   bridgeParts.push(
@@ -249,8 +280,6 @@ export function buildLighthouse(kit: Kit, col: Collision, glass: THREE.Material)
     bridgeParts.push(worldBox(len / steps + 0.02, h, W - 0.5, 0.5).rotateY(yaw).translate(sx, top - h / 2, sz));
   }
   // Parapets.
-  const nx = -d.y;
-  const nz = d.x;
   for (const side of [-1, 1]) {
     bridgeParts.push(
       worldBox(len + 0.4, 1.0, 0.3, 0.5)
@@ -265,24 +294,6 @@ export function buildLighthouse(kit: Kit, col: Collision, glass: THREE.Material)
   const bridge = new THREE.Mesh(mergeAll(bridgeParts), brick);
   bridge.castShadow = bridge.receiveShadow = true;
   group.add(bridge);
-
-  // Collision: bridge deck, parapets, gallery ring, lantern drum and outer rail.
-  col.addSurface(rectSurface(mid.x, mid.z, len / 2 + 0.6, W / 2 - 0.2, yaw, mid.y, rise / len, 0));
-  for (const side of [-1, 1]) {
-    const ox = nx * side * (W / 2 - 0.1);
-    const oz = nz * side * (W / 2 - 0.1);
-    col.addWall(p0.x + ox - d.x * 0.6, p0.z + oz - d.y * 0.6, p1.x + ox - d.x * 0.2, p1.z + oz - d.y * 0.2, 0.3);
-  }
-  col.addSurface(annulusSurface(L.x, L.z, L.lanternRadius - 0.1, L.galleryOuter + 0.15, L.galleryY));
-  col.addCircle(L.x, L.z, L.lanternRadius + 0.15, L.galleryY - 1, L.galleryY + 8);
-  const segs = 28;
-  for (let i = 0; i < segs; i++) {
-    const a0 = gapAng + gapHalf + (i / segs) * arc;
-    const a1 = gapAng + gapHalf + ((i + 1) / segs) * arc;
-    col.addWall(L.x + Math.cos(a0) * railR, L.z + Math.sin(a0) * railR, L.x + Math.cos(a1) * railR, L.z + Math.sin(a1) * railR, 0.25, L.galleryY - 0.5, L.galleryY + 1.2);
-  }
-  // The tower blocks line of sight below the gallery.
-  col.addCircle(L.x, L.z, 3.8, L.stackTop - 3, L.galleryY - 0.6, true);
 
   // Beams: two additive cones that sweep the bay.
   const beamMat = new THREE.ShaderMaterial({

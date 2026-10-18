@@ -118,9 +118,17 @@ function tuftGeometry(blades: number, height: number, seed: number): THREE.Buffe
   return g;
 }
 
-export function buildFoliage(nature: Kit, terrain: Terrain, col: Collision, quality: 'low' | 'high'): FoliageResult {
-  const group = new THREE.Group();
-  group.name = 'foliage';
+/** Every foliage placement, and the collision circles of trees and big rocks, without meshes. */
+export interface FoliageScatter {
+  trees: Placements;
+  small: Placements;
+  /** Grass tuft transforms for the three tuft shapes. */
+  tufts: THREE.Matrix4[][];
+  counts: Record<string, number>;
+  groveGlow: THREE.Vector3[];
+}
+
+export function scatterFoliage(terrain: Terrain, col: Collision, quality: 'low' | 'high'): FoliageScatter {
   const F = new Features();
   const N = new Simplex(31);
   const R = rng(1234);
@@ -128,7 +136,9 @@ export function buildFoliage(nature: Kit, terrain: Terrain, col: Collision, qual
   const small = new Placements();
   const counts: Record<string, number> = {};
   const count = (k: string) => (counts[k] = (counts[k] ?? 0) + 1);
-  const dense = quality === 'high' ? 1 : 0.6;
+  // Solid placements must be identical for every client and the server bake.
+  // Consume the same random sequence at both quality settings; only decoration is thinned later.
+  const dense = 1;
 
   const groundOk = (x: number, z: number, minH = 0.9) => {
     const h = terrain.heightAt(x, z);
@@ -280,6 +290,43 @@ export function buildFoliage(nature: Kit, terrain: Terrain, col: Collision, qual
     } else small.add(`Pebble_Round_${1 + Math.floor(R() * 3)}`, trs(x, h - 0.02, z, R() * 6.3, 1 + R() * 2));
   }
 
+  // Grass tufts: dense on meadows near paths and buildings, sparser elsewhere.
+  const tuftCount = quality === 'high' ? 18000 : 8000;
+  const tufts: THREE.Matrix4[][] = [[], [], []];
+  let placedTufts = 0;
+  for (let i = 0; i < tuftCount * 3 && placedTufts < tuftCount; i++) {
+    const x = -140 + R() * 270;
+    const z = -150 + R() * 300;
+    const dist = Math.hypot(x - 20, z);
+    if (R() > 1.15 - dist / 160) continue;
+    if (Math.hypot(x, z) < 30 && R() < 0.6) continue;
+    const m = F.mask(x, z);
+    if (m.road < 0.3 || m.built < 0.4) continue;
+    const h = groundOk(x, z, 1.0);
+    if (h === null) continue;
+    if (terrain.splatAt(x, z, 2) > 0.3 || terrain.splatAt(x, z, 1) > 0.3) continue;
+    const patch = N.fbm(x / 9, z / 9 + 70, 2);
+    if (patch < -0.25 && R() < 0.7) continue;
+    const s = 0.8 + R() * 0.7 + Math.max(0, patch) * 0.6;
+    const tm = trs(x, h - 0.03, z, R() * 6.3, s);
+    tufts[Math.floor(R() * 3)].push(tm);
+    placedTufts++;
+  }
+  counts.tufts = placedTufts;
+  if (quality === 'low') {
+    for (const [name, matrices] of small.items) {
+      // All rocks stay visible because the larger ones block movement.
+      if (!name.startsWith('Rock_')) small.items.set(name, matrices.filter((_, i) => i % 5 < 3));
+    }
+  }
+  return { trees, small, tufts, counts, groveGlow };
+}
+
+export function buildFoliage(nature: Kit, scatter: FoliageScatter, quality: 'low' | 'high'): FoliageResult {
+  const group = new THREE.Group();
+  group.name = 'foliage';
+  const { trees, small, tufts: tuftPlacements, counts, groveGlow } = scatter;
+
   // Materials: saturate, recolour, sway. Twisted trees become the grove's moonlit teal; the same
   // leaf atlas on bushes turns summer green.
   const variants = new Map<string, THREE.Material>();
@@ -355,40 +402,21 @@ export function buildFoliage(nature: Kit, terrain: Terrain, col: Collision, qual
     fields.push(f);
   }
 
-  // Grass tufts: dense on meadows near paths and buildings, sparser elsewhere.
+  // Grass tufts.
   const tufts = [tuftGeometry(8, 0.5, 1), tuftGeometry(6, 0.7, 2), tuftGeometry(9, 0.4, 3)];
   const grassMat = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.92, side: THREE.DoubleSide });
   windSway(grassMat, 0.14, 0.9, 1.6);
   addPatch(grassMat, 'grass-tint', (shader) => {
     shader.fragmentShader = shader.fragmentShader.replace('#include <color_fragment>', '#include <color_fragment>\ndiffuseColor.rgb *= 1.0;');
   });
-  const tuftCount = quality === 'high' ? 18000 : 8000;
   const tuftFields = tufts.map(
     (g, i) => new InstanceField(`grass-${i}`, [{ parts: [{ geometry: g, material: grassMat }], maxDist: quality === 'high' ? 60 : 42, castShadow: false }], 18, 1.2),
   );
-  const m4 = new THREE.Matrix4();
-  let placedTufts = 0;
-  for (let i = 0; i < tuftCount * 3 && placedTufts < tuftCount; i++) {
-    const x = -140 + R() * 270;
-    const z = -150 + R() * 300;
-    const dist = Math.hypot(x - 20, z);
-    if (R() > 1.15 - dist / 160) continue;
-    if (Math.hypot(x, z) < 30 && R() < 0.6) continue;
-    const m = F.mask(x, z);
-    if (m.road < 0.3 || m.built < 0.4) continue;
-    const h = groundOk(x, z, 1.0);
-    if (h === null) continue;
-    if (terrain.splatAt(x, z, 2) > 0.3 || terrain.splatAt(x, z, 1) > 0.3) continue;
-    const patch = N.fbm(x / 9, z / 9 + 70, 2);
-    if (patch < -0.25 && R() < 0.7) continue;
-    const s = 0.8 + R() * 0.7 + Math.max(0, patch) * 0.6;
-    m4.copy(trs(x, h - 0.03, z, R() * 6.3, s));
-    tuftFields[Math.floor(R() * 3)].add(m4);
-    placedTufts++;
-  }
+  tuftPlacements.forEach((list, i) => {
+    for (const m of list) tuftFields[i].add(m);
+  });
   fields.push(...tuftFields);
   for (const f of fields) group.add(f.build());
-  counts.tufts = placedTufts;
 
   const frustum = new THREE.Frustum();
   const pm = new THREE.Matrix4();

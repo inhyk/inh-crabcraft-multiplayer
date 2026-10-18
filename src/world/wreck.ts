@@ -3,7 +3,7 @@
 // section lies apart, sinking at a steep angle with the funnel and wheelhouse. A plank gangway
 // climbs from the beach.
 import * as THREE from 'three';
-import { type Collision, polySurface, rectSurface } from './collision';
+import { type Collision, type DeckHeight, deckHeight, polySurface, rectSurface } from './collision';
 import { mergeAll } from './fountain';
 import { tube, worldBox } from './geom';
 import { type StaticBatch, trs } from './kit';
@@ -113,7 +113,26 @@ function deckGeometry(x0: number, x1: number): THREE.BufferGeometry {
   return g;
 }
 
-export function buildWreck(col: Collision, batch: StaticBatch, propBatch: StaticBatch): Wreck {
+const DEBRIS: [string, number, number, number, number][] = [
+  ['Barrel', 30, -6, 0.3, 1],
+  ['Crate_Wooden', 31, -9, 1.1, 1.2],
+  ['Chain_Coil', 29, -12, 0, 1.4],
+  ['Crate_Wooden', 33, -15, 2.4, 1],
+  ['Barrel', 24, -17, 1.6, 1],
+  ['Rope_3', 26, -20, 0.4, 1.3],
+  ['Crate_Metal', 20, -19, 0.7, 1.1],
+  ['Barrel', 17, -22, 2.2, 1],
+  ['Chest_Wood', 34, -3, 2.9, 1],
+];
+const BRAZIERS: [number, number][] = [
+  [-7.5, -9.6],
+  [-7.5, 9.6],
+  [13.8, -8.4],
+  [13.8, 8.4],
+];
+
+/** The ship's frame and every wreck collider, without meshes: the server bakes these. */
+export function layoutWreck(col: Collision) {
   const group = new THREE.Group();
   group.name = 'wreck';
   const ship = new THREE.Group();
@@ -125,15 +144,131 @@ export function buildWreck(col: Collision, batch: StaticBatch, propBatch: Static
   const ax = new THREE.Vector3(1, 0, 0).transformDirection(M);
   const az = new THREE.Vector3(0, 0, 1).transformDirection(M);
   const toWorld = (lx: number, lz: number, ly = 0) => new THREE.Vector3(lx, ly, lz).applyMatrix4(M);
-  const toLocal = (x: number, z: number): [number, number] => {
-    const dx = x - WRECK.x;
-    const dz = z - WRECK.z;
-    return [dx * ax.x + dz * ax.z, dx * az.x + dz * az.z];
+  const deck: DeckHeight = {
+    kind: 'deck',
+    ox: WRECK.x,
+    oz: WRECK.z,
+    axx: ax.x,
+    axz: ax.z,
+    azx: az.x,
+    azz: az.z,
+    y0: WRECK.deckY,
+    sinPitch: Math.sin(WRECK.pitch),
+    sinRoll: Math.sin(ROLL),
+    cosPitch: Math.cos(WRECK.pitch),
+    halfL: HALF_L,
   };
-  const deckHeight = (x: number, z: number) => {
-    const [lx, lz] = toLocal(x, z);
-    return WRECK.deckY + lx * Math.sin(WRECK.pitch) - lz * Math.sin(ROLL) * Math.cos(WRECK.pitch) + sheerAt(lx);
-  };
+  const deckY = (x: number, z: number) => deckHeight(deck, x, z);
+  // Stern section: broken off, settled deeper and steeply tilted.
+  // Pivot at the torn end so the stern itself dives under while the break rears up.
+  const pivotX = BREAK_X - 1.5;
+  const stern = new THREE.Group();
+  stern.position.set(pivotX - 1.4, -1.0, 1.6);
+  stern.rotation.set(0.14, 0.09, 0.2, 'YZX');
+  ship.add(stern);
+  stern.updateMatrixWorld(true);
+  const sternMatrix = stern.matrixWorld.clone();
+  // The meshes add the stern back after the bow, keeping the scene's child order.
+  ship.remove(stern);
+  const sternWorld = (lx: number, ly: number, lz: number) => new THREE.Vector3(lx - pivotX, ly, lz).applyMatrix4(sternMatrix);
+
+  // Collision: bow deck surface, bulwarks with a gangway gap on the beach (-z) side, the break.
+  const gwX0 = 9;
+  const gwX1 = 13.5;
+  const xs: number[] = [];
+  for (let x = BREAK_X + 0.6; x <= HALF_L + 0.001; x += 0.75) xs.push(x);
+  const poly: [number, number][] = [];
+  for (const x of xs) {
+    const p = toWorld(x, -Math.max(halfBeam(x) - 0.15, 0));
+    poly.push([p.x, p.z]);
+  }
+  for (let i = xs.length - 1; i >= 0; i--) {
+    const p = toWorld(xs[i], Math.max(halfBeam(xs[i]) - 0.15, 0));
+    poly.push([p.x, p.z]);
+  }
+  col.addSurface(polySurface(poly, deck));
+  for (const side of [-1, 1]) {
+    for (let i = 0; i < xs.length - 1; i++) {
+      const xa = xs[i];
+      const xb = xs[i + 1];
+      if (side === -1 && xb > gwX0 && xa < gwX1) continue;
+      const a = toWorld(xa, side * halfBeam(xa));
+      const b = toWorld(xb, side * halfBeam(xb));
+      col.addWall(a.x, a.z, b.x, b.z, 0.5, -12, WRECK.deckY + 8);
+    }
+  }
+  const brA = toWorld(BREAK_X + 0.5, -HALF_B);
+  const brB = toWorld(BREAK_X + 0.5, HALF_B);
+  col.addWall(brA.x, brA.z, brB.x, brB.z, 0.6, -12, WRECK.deckY + 8);
+  const cap = toWorld(21.5, 0);
+  col.addCircle(cap.x, cap.z, 1.25);
+  const mast = toWorld(19.2, -1.2);
+  col.addCircle(mast.x, mast.z, 0.7);
+  for (const z of [-4.2, 4.2]) {
+    const b = toWorld(17.5, z);
+    col.addCircle(b.x, b.z, 0.5);
+    const v = toWorld(14.3, z * 2.3);
+    col.addCircle(v.x, v.z, 0.6);
+  }
+  const hatch = toWorld(-7.6, -8.6);
+  col.addBox(hatch.x, hatch.z, 1.6, 2.4, WRECK.rotY);
+  // Hull blocks line of sight below the deck, seen from outside.
+  const hc = toWorld((BREAK_X + HALF_L) / 2, 0);
+  col.addBox(hc.x, hc.z, ((HALF_L - BREAK_X) / 2) * 0.9, HALF_B * 0.9, WRECK.rotY, -12, WRECK.deckY - 0.7, true);
+  const sc = sternWorld(-20, 0, 0);
+  col.addBox(sc.x, sc.z, 8, HALF_B, WRECK.rotY, -12, WRECK.deckY + 6);
+
+  // Gangway: planks from the beach up to the deck gap.
+  const gwMid = (gwX0 + gwX1) / 2;
+  const deckEdge = toWorld(gwMid, -halfBeam(gwMid));
+  const out = az.clone().setY(0).normalize().negate();
+  const foot = deckEdge.clone().addScaledVector(out, 12);
+  foot.y = Math.max(col.terrain.heightAt(foot.x, foot.z), 0.3);
+  const topY = deckY(deckEdge.x, deckEdge.z);
+  const glen = Math.hypot(foot.x - deckEdge.x, foot.z - deckEdge.z);
+  const gyaw = Math.atan2(-(foot.z - deckEdge.z), foot.x - deckEdge.x);
+  const gmid = deckEdge.clone().lerp(foot, 0.5);
+  gmid.y = (topY + foot.y) / 2;
+  const gslope = (foot.y - topY) / glen;
+  col.addSurface(rectSurface(gmid.x, gmid.z, glen / 2 + 0.5, 2.0, gyaw, gmid.y, gslope, 0));
+  const nx = Math.sin(gyaw);
+  const nz = Math.cos(gyaw);
+  for (const side of [-1, 1]) {
+    col.addWall(
+      deckEdge.x + nx * side * 2.05,
+      deckEdge.z + nz * side * 2.05,
+      foot.x + nx * side * 2.05 - (foot.x - deckEdge.x) * 0.12,
+      foot.z + nz * side * 2.05 - (foot.z - deckEdge.z) * 0.12,
+      0.3,
+      -5,
+      WRECK.deckY + 3,
+    );
+  }
+  // Beach debris around the bow: crates, barrels, chain, rope and hull plates.
+  const debris: { name: string; p: THREE.Vector3; y: number; rot: number; s: number }[] = [];
+  for (const [name, lx, lz, rot, s] of DEBRIS) {
+    const p = toWorld(lx, lz);
+    const y = col.terrain.heightAt(p.x, p.z);
+    if (y < -0.3) continue;
+    debris.push({ name, p, y, rot, s });
+    if (name !== 'Rope_3' && name !== 'Chain_Coil') col.addCircle(p.x, p.z, 0.55 * s);
+  }
+  // Iron braziers at the arena's corners: light for the night fight.
+  const braziers = BRAZIERS.map(([lx, lz]) => {
+    const p = toWorld(lx, lz);
+    const y = deckY(p.x, p.z);
+    col.addCircle(p.x, p.z, 0.75);
+    return { p, y };
+  });
+  const ground = (x: number, z: number) => col.terrain.heightAt(x, z);
+  return { group, ship, stern, pivotX, ax, toWorld, deckHeight: deckY, sternWorld, ground, gangway: { deckEdge, foot, topY, glen, gyaw, gmid, gslope, nx, nz }, debris, braziers };
+}
+
+export type WreckLayout = ReturnType<typeof layoutWreck>;
+
+export function buildWreck(layout: WreckLayout, batch: StaticBatch, propBatch: StaticBatch): Wreck {
+  const { group, ship, stern, pivotX, ax, toWorld, deckHeight, sternWorld, gangway: gw, debris, braziers, ground } = layout;
+  const { deckEdge, foot, topY, glen, gyaw, gmid, gslope, nx, nz } = gw;
 
   const hullMat = rustMaterial({ axis: ax, base: '#36312f', rust: '#9c4a20' });
   hullMat.side = THREE.DoubleSide;
@@ -180,12 +315,7 @@ export function buildWreck(col: Collision, batch: StaticBatch, propBatch: Static
   const glowMat = new THREE.MeshStandardMaterial({ color: '#100604', emissive: '#ff4a14', emissiveIntensity: 2.2, roughness: 1 });
   ship.add(new THREE.Mesh(new THREE.PlaneGeometry(2.6, 4.2).rotateX(-Math.PI / 2).translate(-7.6, 0.4, -8.6), glowMat));
 
-  // Stern section: broken off, settled deeper and steeply tilted.
-  // Pivot at the torn end so the stern itself dives under while the break rears up.
-  const pivotX = BREAK_X - 1.5;
-  const stern = new THREE.Group();
-  stern.position.set(pivotX - 1.4, -1.0, 1.6);
-  stern.rotation.set(0.14, 0.09, 0.2, 'YZX');
+  // Stern section (frame in layoutWreck).
   const sternHull = new THREE.Mesh(hullGeometry(-HALF_L, BREAK_X - 1.5, 'end', 9).translate(-pivotX, 0, 0), hullMat);
   const sternDeck = new THREE.Mesh(deckGeometry(-HALF_L + 0.2, BREAK_X - 2.2).translate(-pivotX, 0, 0), deckMat);
   const sp: THREE.BufferGeometry[] = [];
@@ -205,68 +335,8 @@ export function buildWreck(col: Collision, batch: StaticBatch, propBatch: Static
   stern.add(new THREE.Mesh(mergeAll(winGeo).translate(-pivotX, 0, 0), glowMat));
   ship.add(stern);
   stern.updateMatrixWorld(true);
-  const sternWorld = (lx: number, ly: number, lz: number) => new THREE.Vector3(lx - pivotX, ly, lz).applyMatrix4(stern.matrixWorld);
   const embers = [toWorld(-7.6, -8.6, 0.8), sternWorld(-22, 5.4, 0), sternWorld(-15.5, 7.6, 0)];
 
-  // Collision: bow deck surface, bulwarks with a gangway gap on the beach (-z) side, the break.
-  const gwX0 = 9;
-  const gwX1 = 13.5;
-  const xs: number[] = [];
-  for (let x = BREAK_X + 0.6; x <= HALF_L + 0.001; x += 0.75) xs.push(x);
-  const poly: [number, number][] = [];
-  for (const x of xs) {
-    const p = toWorld(x, -Math.max(halfBeam(x) - 0.15, 0));
-    poly.push([p.x, p.z]);
-  }
-  for (let i = xs.length - 1; i >= 0; i--) {
-    const p = toWorld(xs[i], Math.max(halfBeam(xs[i]) - 0.15, 0));
-    poly.push([p.x, p.z]);
-  }
-  col.addSurface(polySurface(poly, deckHeight));
-  for (const side of [-1, 1]) {
-    for (let i = 0; i < xs.length - 1; i++) {
-      const xa = xs[i];
-      const xb = xs[i + 1];
-      if (side === -1 && xb > gwX0 && xa < gwX1) continue;
-      const a = toWorld(xa, side * halfBeam(xa));
-      const b = toWorld(xb, side * halfBeam(xb));
-      col.addWall(a.x, a.z, b.x, b.z, 0.5, -12, WRECK.deckY + 8);
-    }
-  }
-  const brA = toWorld(BREAK_X + 0.5, -HALF_B);
-  const brB = toWorld(BREAK_X + 0.5, HALF_B);
-  col.addWall(brA.x, brA.z, brB.x, brB.z, 0.6, -12, WRECK.deckY + 8);
-  const cap = toWorld(21.5, 0);
-  col.addCircle(cap.x, cap.z, 1.25);
-  const mast = toWorld(19.2, -1.2);
-  col.addCircle(mast.x, mast.z, 0.7);
-  for (const z of [-4.2, 4.2]) {
-    const b = toWorld(17.5, z);
-    col.addCircle(b.x, b.z, 0.5);
-    const v = toWorld(14.3, z * 2.3);
-    col.addCircle(v.x, v.z, 0.6);
-  }
-  const hatch = toWorld(-7.6, -8.6);
-  col.addBox(hatch.x, hatch.z, 1.6, 2.4, WRECK.rotY);
-  // Hull blocks line of sight below the deck, seen from outside.
-  const hc = toWorld((BREAK_X + HALF_L) / 2, 0);
-  col.addBox(hc.x, hc.z, ((HALF_L - BREAK_X) / 2) * 0.9, HALF_B * 0.9, WRECK.rotY, -12, WRECK.deckY - 0.7, true);
-  const sc = sternWorld(-20, 0, 0);
-  col.addBox(sc.x, sc.z, 8, HALF_B, WRECK.rotY, -12, WRECK.deckY + 6);
-
-  // Gangway: planks from the beach up to the deck gap.
-  const gwMid = (gwX0 + gwX1) / 2;
-  const deckEdge = toWorld(gwMid, -halfBeam(gwMid));
-  const out = az.clone().setY(0).normalize().negate();
-  const foot = deckEdge.clone().addScaledVector(out, 12);
-  foot.y = Math.max(col.terrain.heightAt(foot.x, foot.z), 0.3);
-  const topY = deckHeight(deckEdge.x, deckEdge.z);
-  const glen = Math.hypot(foot.x - deckEdge.x, foot.z - deckEdge.z);
-  const gyaw = Math.atan2(-(foot.z - deckEdge.z), foot.x - deckEdge.x);
-  const gmid = deckEdge.clone().lerp(foot, 0.5);
-  gmid.y = (topY + foot.y) / 2;
-  const gslope = (foot.y - topY) / glen;
-  col.addSurface(rectSurface(gmid.x, gmid.z, glen / 2 + 0.5, 2.0, gyaw, gmid.y, gslope, 0));
   const wood = plankMaterial();
   const plankParts: THREE.BufferGeometry[] = [];
   const nplank = Math.ceil(glen / 0.55);
@@ -284,8 +354,6 @@ export function buildWreck(col: Collision, batch: StaticBatch, propBatch: Static
         .translate(px, py, pz),
     );
   }
-  const nx = Math.sin(gyaw);
-  const nz = Math.cos(gyaw);
   for (const side of [-1, 1]) {
     plankParts.push(
       worldBox(glen + 0.4, 0.28, 0.28, 1)
@@ -304,21 +372,10 @@ export function buildWreck(col: Collision, batch: StaticBatch, propBatch: Static
   const gangway = new THREE.Mesh(mergeAll(plankParts), wood);
   gangway.castShadow = gangway.receiveShadow = true;
   group.add(gangway);
-  for (const side of [-1, 1]) {
-    col.addWall(
-      deckEdge.x + nx * side * 2.05,
-      deckEdge.z + nz * side * 2.05,
-      foot.x + nx * side * 2.05 - (foot.x - deckEdge.x) * 0.12,
-      foot.z + nz * side * 2.05 - (foot.z - deckEdge.z) * 0.12,
-      0.3,
-      -5,
-      WRECK.deckY + 3,
-    );
-  }
   // Anchor chain from the hawse pipe down to the sand.
   const hawse = toWorld(25.5, -halfBeam(25.5) + 0.4, 0.4 + sheerAt(25.5));
   const sandEnd = toWorld(36, -14);
-  sandEnd.y = col.terrain.heightAt(sandEnd.x, sandEnd.z) - 0.1;
+  sandEnd.y = ground(sandEnd.x, sandEnd.z) - 0.1;
   const chainPts: THREE.Vector3[] = [];
   for (let i = 0; i <= 24; i++) {
     const t = i / 24;
@@ -330,25 +387,9 @@ export function buildWreck(col: Collision, batch: StaticBatch, propBatch: Static
   chain.castShadow = true;
   group.add(chain);
 
-  // Beach debris around the bow: crates, barrels, chain, rope and hull plates.
-  const debris: [string, number, number, number, number][] = [
-    ['Barrel', 30, -6, 0.3, 1],
-    ['Crate_Wooden', 31, -9, 1.1, 1.2],
-    ['Chain_Coil', 29, -12, 0, 1.4],
-    ['Crate_Wooden', 33, -15, 2.4, 1],
-    ['Barrel', 24, -17, 1.6, 1],
-    ['Rope_3', 26, -20, 0.4, 1.3],
-    ['Crate_Metal', 20, -19, 0.7, 1.1],
-    ['Barrel', 17, -22, 2.2, 1],
-    ['Chest_Wood', 34, -3, 2.9, 1],
-  ];
-  for (const [name, lx, lz, rot, s] of debris) {
-    const p = toWorld(lx, lz);
-    const y = col.terrain.heightAt(p.x, p.z);
-    if (y < -0.3) continue;
+  for (const { name, p, y, rot, s } of debris) {
     const tilt = name === 'Barrel' && rot > 1 ? Math.PI / 2 : 0;
     propBatch.add(name, trs(p.x, y + (tilt ? 0.33 : -0.05), p.z, WRECK.rotY + rot, s, 0, tilt));
-    if (name !== 'Rope_3' && name !== 'Chain_Coil') col.addCircle(p.x, p.z, 0.55 * s);
   }
   const plateParts: THREE.BufferGeometry[] = [];
   const plates: [number, number, number, number][] = [
@@ -359,7 +400,7 @@ export function buildWreck(col: Collision, batch: StaticBatch, propBatch: Static
   ];
   for (const [lx, lz, rot, tilt] of plates) {
     const p = toWorld(lx, lz);
-    const y = col.terrain.heightAt(p.x, p.z);
+    const y = ground(p.x, p.z);
     plateParts.push(worldBox(3.4, 0.18, 2.4, 0.4).rotateX(tilt).rotateY(WRECK.rotY + rot).translate(p.x, y + 0.25, p.z));
   }
   const plateMesh = new THREE.Mesh(mergeAll(plateParts), hullMat);
@@ -371,14 +412,7 @@ export function buildWreck(col: Collision, batch: StaticBatch, propBatch: Static
   const fires: THREE.Vector3[] = [];
   const brazParts: THREE.BufferGeometry[] = [];
   const coalParts: THREE.BufferGeometry[] = [];
-  for (const [lx, lz] of [
-    [-7.5, -9.6],
-    [-7.5, 9.6],
-    [13.8, -8.4],
-    [13.8, 8.4],
-  ] as [number, number][]) {
-    const p = toWorld(lx, lz);
-    const y = deckHeight(p.x, p.z);
+  for (const { p, y } of braziers) {
     for (let i = 0; i < 3; i++) {
       const a = (i / 3) * Math.PI * 2;
       brazParts.push(new THREE.CylinderGeometry(0.06, 0.08, 1.7, 5).rotateZ(0.18).rotateY(a).translate(p.x + Math.cos(a) * 0.32, y + 0.8, p.z + Math.sin(a) * 0.32));
@@ -391,7 +425,6 @@ export function buildWreck(col: Collision, batch: StaticBatch, propBatch: Static
     );
     coalParts.push(new THREE.CircleGeometry(0.6, 12).rotateX(-Math.PI / 2).translate(p.x, y + 1.95, p.z));
     fires.push(new THREE.Vector3(p.x, y + 2.35, p.z));
-    col.addCircle(p.x, p.z, 0.75);
   }
   const brazMesh = new THREE.Mesh(mergeAll(brazParts), new THREE.MeshStandardMaterial({ color: '#2a2420', roughness: 0.6, metalness: 0.7 }));
   brazMesh.castShadow = true;

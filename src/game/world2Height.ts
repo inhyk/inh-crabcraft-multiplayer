@@ -1,7 +1,8 @@
 import {MathUtils} from 'three';
 import {STAR_OBJECTIVES} from './world2Settlement';
+import {STAR_GRID,starSurfaceHeight} from '../sim/world/ground';
 
-const NX=141,NZ=161,STEP=2,MIN_X=-140,MIN_Z=-160;
+const {nx:NX,nz:NZ,step:STEP,minX:MIN_X,minZ:MIN_Z}=STAR_GRID;
 
 function naturalHeight(x:number,z:number){
   const r=Math.hypot(x/115,(z-10)/140),coast=MathUtils.smoothstep(r,.83,1.04);
@@ -26,10 +27,4 @@ export function buildStarHeights(){
   return heights;
 }
 
-/** PlaneGeometry uses a–b–d / b–c–d triangles. Follow their planes, including off-grid points. */
-export function starSurfaceHeight(heights:Float32Array,x:number,z:number){
-  const gx=MathUtils.clamp((x-MIN_X)/STEP,0,NX-1),gz=MathUtils.clamp((z-MIN_Z)/STEP,0,NZ-1);
-  const ix=Math.min(NX-2,Math.floor(gx)),iz=Math.min(NZ-2,Math.floor(gz)),u=gx-ix,v=gz-iz;
-  const a=heights[iz*NX+ix],b=heights[(iz+1)*NX+ix],d=heights[iz*NX+ix+1],c=heights[(iz+1)*NX+ix+1];
-  return u+v<=1?a+(d-a)*u+(b-a)*v:c+(b-c)*(1-u)+(d-c)*(1-v);
-}
+export {starSurfaceHeight};

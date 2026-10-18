@@ -3,6 +3,10 @@ import {mergeGeometries} from 'three/addons/utils/BufferGeometryUtils.js';
 import type {Collision} from '../world/collision';
 
 const SITES=[{kind:'forge',x:-29,z:37,yaw:Math.PI/2},{kind:'tavern',x:-23,z:61,yaw:Math.PI/2},{kind:'chapel',x:23,z:38,yaw:-Math.PI/2}] as const;
+/** The sign posts are thin solids beside the shop doors. */
+export function registerStarSigns(height:(x:number,z:number)=>number,collision:Collision){
+  for(const site of SITES){const y=height(site.x,site.z);collision.addCircle(site.x,site.z,.26,y,y+4.8);}
+}
 const merge=(parts:THREE.BufferGeometry[])=>{
   const triangles=parts.map(g=>g.index?g.toNonIndexed():g);
   for(const g of triangles)g.deleteAttribute('uv');
@@ -26,7 +30,7 @@ export class StarVillageSigns {
   private pivot=new THREE.Matrix4().makeTranslation(1.25,4.3,0);
   private drop=new THREE.Matrix4().makeTranslation(0,-1.05,0);
   private rotation=new THREE.Matrix4();
-  constructor(height:(x:number,z:number)=>number,collision:Collision){
+  constructor(height:(x:number,z:number)=>number){
     this.root.name='star-village-signs';
     const wood=new THREE.MeshStandardMaterial({color:'#392c2b',roughness:.82});
     const brass=new THREE.MeshStandardMaterial({color:'#bc9859',metalness:.68,roughness:.38});
@@ -66,7 +70,6 @@ export class StarVillageSigns {
       const y=height(site.x,site.z),anchor=new THREE.Matrix4().makeRotationY(site.yaw);anchor.setPosition(site.x,y,site.z);this.anchors.push(anchor);supports.setMatrixAt(i,anchor);metal.setMatrixAt(i,anchor);
       const colour=['#ffc681','#f1c6a0','#a8f0f3'][i];const material=new THREE.MeshStandardMaterial({color:colour,emissive:colour,emissiveIntensity:.22,metalness:.55,roughness:.38});
       const emblem=new THREE.Mesh([forge,tavern,chapel][i],material);emblem.name=`star-sign-${site.kind}`;emblem.matrixAutoUpdate=false;this.emblems.push(emblem);this.root.add(emblem);
-      collision.addCircle(site.x,site.z,.26,y,y+4.8);
     }
     this.update(0);
   }

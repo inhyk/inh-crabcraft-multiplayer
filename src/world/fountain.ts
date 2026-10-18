@@ -21,13 +21,17 @@ export function bronzeMaterial(): THREE.MeshPhysicalMaterial {
   return new THREE.MeshPhysicalMaterial({ color: '#8c0c14', metalness: 0.0, roughness: 0.55, sheen: 0.15, sheenColor: '#ff2a18', sheenRoughness: 0.6, envMapIntensity: 0.2 });
 }
 
+/** The Pincer Fountain's basin blocks movement. */
+export function registerFountain(col: Collision, x: number, y: number, z: number): void {
+  col.addCircle(x, z, 5.0, y - 1, y + 9);
+}
+
 export function buildFountain(
   x: number,
   y: number,
   z: number,
   stone: THREE.Material,
   sky: SkyUniforms,
-  col: Collision,
 ): Fountain {
   const group = new THREE.Group();
   group.name = 'fountain';
@@ -156,7 +160,6 @@ export function buildFountain(
   water.renderOrder = 3;
   group.add(water);
 
-  col.addCircle(x, z, 5.0, y - 1, y + 9);
   const spouts = [tipL, tipR].map((p) => p.clone().add(group.position));
   return { group, spouts, waterY: y + waterY, radius: 4.2 };
 }

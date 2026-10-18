@@ -13,7 +13,7 @@
     "typecheck": "tsc --noEmit",
     "shot": "node tools/shot.mjs",
     "multiplayer": "vite preview --host 0.0.0.0 --port 5174 --strictPort",
-    "test:multiplayer": "node --experimental-strip-types --test server/rooms.test.mjs server/chat/filter.test.mjs server/chat/safety.test.mjs",
+    "test:multiplayer": "node --experimental-strip-types --test server/rooms.test.mjs server/chat/filter.test.mjs server/chat/safety.test.mjs tests/collision-bake.test.mjs",
     "test:server": "node server/node/build.mjs && node --test server/node/server.test.mjs",
     "test:boss": "node tests/run-boss.mjs",
     "test:engine": "node tests/run-engine.mjs"

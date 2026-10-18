@@ -2,11 +2,19 @@ import * as THREE from 'three';
 import type {Collision} from '../world/collision';
 import {starTrailDistance} from './world2Settlement';
 
+const COLUMN_HEIGHTS=[5,4.5,3.8,5,4.6,3.2,4.8,5,3.6,4.5];
+const column=(i:number)=>{const a=i/10*Math.PI*2;return {a,x:80+Math.cos(a)*9,z:-40+Math.sin(a)*9,h:COLUMN_HEIGHTS[i]};};
+
+/** The ten columns are solid up to their capitals. */
+export function registerStarObservatory(height:(x:number,z:number)=>number,collision:Collision){
+  for(let i=0;i<10;i++){const {x,z,h}=column(i),y=height(x,z);collision.addCircle(x,z,.9,y,y+h);}
+}
+
 /** Weathered observatory masonry. Existing column footprints keep the approach and quest clear. */
 export class StarObservatory {
   readonly root=new THREE.Group();
   private ripples:THREE.Mesh[]=[];
-  constructor(height:(x:number,z:number)=>number,collision:Collision){
+  constructor(height:(x:number,z:number)=>number){
     this.root.name='fallen-star-observatory';
     const stone=new THREE.MeshStandardMaterial({color:'#9690a5',roughness:.87,metalness:.12,flatShading:true});
     const trim=new THREE.MeshStandardMaterial({color:'#baa885',roughness:.63,metalness:.35});
@@ -17,9 +25,8 @@ export class StarObservatory {
     const bands=new THREE.InstancedMesh(new THREE.CylinderGeometry(.66,.69,.11,12),trim,20);bands.name='observatory-column-bands';
     const runes=new THREE.InstancedMesh(new THREE.OctahedronGeometry(.12),glow,20);runes.name='observatory-column-runes';
     const matrix=new THREE.Matrix4(),rotation=new THREE.Quaternion(),scale=new THREE.Vector3(1,1,1);
-    const heights=[5,4.5,3.8,5,4.6,3.2,4.8,5,3.6,4.5];
     for(let i=0;i<10;i++){
-      const a=i/10*Math.PI*2,x=80+Math.cos(a)*9,z=-40+Math.sin(a)*9,y=height(x,z),h=heights[i];
+      const {a,x,z,h}=column(i),y=height(x,z);
       rotation.setFromAxisAngle(new THREE.Vector3(0,1,0),a);
       matrix.compose(new THREE.Vector3(x,y+.16,z),rotation,scale);bases.setMatrixAt(i,matrix);
       matrix.compose(new THREE.Vector3(x,y+h/2,z),rotation,new THREE.Vector3(1,h-.64,1));shafts.setMatrixAt(i,matrix);
@@ -28,7 +35,6 @@ export class StarObservatory {
         matrix.compose(new THREE.Vector3(x,y+.5+j*(h-1),z),rotation,scale);bands.setMatrixAt(i*2+j,matrix);
         matrix.compose(new THREE.Vector3(x-Math.cos(a)*.73,y+h-.75-j*.4,z-Math.sin(a)*.73),rotation,new THREE.Vector3(.65,1.3,.65));runes.setMatrixAt(i*2+j,matrix);
       }
-      collision.addCircle(x,z,.9,y,y+h);
     }
     for(const mesh of [shafts,bases,capitals,bands,runes]){mesh.castShadow=true;mesh.receiveShadow=true;this.root.add(mesh);}
     // Reuse the deterministic rubble field, keeping stones off the marked walking trails.

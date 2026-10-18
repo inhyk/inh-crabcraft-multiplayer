@@ -1,10 +1,15 @@
 import * as THREE from 'three';
 import {facetedStarCrystal} from './starCrystal';
 
+/** The twelve column footprints around the final arena: solid to movement and to sight. */
+export function throneSolids():{x:number;z:number;r:number}[]{
+  return Array.from({length:12},(_,i)=>{const a=i/12*Math.PI*2;return {x:Math.sin(a)*21,z:-75+Math.cos(a)*21,r:1.7};});
+}
+
 /** The final arena's perimeter architecture; its original twelve footprints stay unchanged. */
 export class StarThrone {
   readonly root=new THREE.Group();
-  readonly solids:{x:number;z:number;r:number}[]=[];
+  readonly solids=throneSolids();
   private gems:THREE.InstancedMesh[]=[];
   private anchors:{x:number;y:number;z:number;side:number;index:number;angle:number}[]=[];
   private matrix=new THREE.Matrix4();
@@ -27,8 +32,7 @@ export class StarThrone {
       const mesh=new THREE.InstancedMesh(geometry,glow,6);mesh.name=`star-throne-crystals-${i}`;mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);mesh.frustumCulled=false;this.gems.push(mesh);this.root.add(mesh);
     }
     for(let i=0;i<12;i++){
-      const a=i/12*Math.PI*2,x=Math.sin(a)*21,z=-75+Math.cos(a)*21,h=5+(i%3)*2,y=height(x,z);
-      this.solids.push({x,z,r:1.7});
+      const a=i/12*Math.PI*2,{x,z}=this.solids[i],h=5+(i%3)*2,y=height(x,z);
       this.matrix.compose(this.position.set(x,y+h/2,z),this.quaternion.identity(),this.scale.set(1,h,1));shafts.setMatrixAt(i,this.matrix);
       for(let j=0;j<2;j++){
         // Invert around X at the top so both capitals flare away from the shaft.

@@ -4,13 +4,13 @@ import {t} from '../i18n';
 import type { Game } from './game';
 import type { Poi } from '../world/types';
 import { snapshotMap } from './snapshots';
-import { buildStarSettlement, STAR_TOWN, STAR_WALKS, STAR_OBJECTIVES, STAR_TRAILS, starTrailDistance, nearStarObjective } from './world2Settlement';
+import { buildStarSettlement, STAR_TOWN, STAR_WALKS, STAR_OBJECTIVES, STAR_TRAILS } from './world2Settlement';
 import { QUESTS, type ObjectiveKind, type ObjectiveDef } from './quests';
 import type { Collision } from '../world/collision';
 import { StarPortal } from './portal';
 import { StarVillageLife } from './world2Life';
 import {starGroundColor} from './world2Ground';
-import {facetedStarCrystal,starCrystalRadius} from './starCrystal';
+import {facetedStarCrystal} from './starCrystal';
 import {collectibleShadow} from './collectibleShadow';
 import {StarSky} from './starSky';
 import {StarSea} from './starSea';
@@ -24,6 +24,8 @@ import {StarSun} from './starSun';
 import {StarEnemyArmour} from './starEnemyArmour';
 import {StarThrone} from './starThrone';
 import {buildStarHeights,starSurfaceHeight} from './world2Height';
+import {layoutStarhaven,starCrystalGarden} from './world2Colliders';
+import {DAWN_BOUNDS,resolveOnIsland,STAR_BOUNDS} from '../sim/world/queries';
 
 /** A separate, deterministic realm; all clients build the same island and collision surface. */
 export class HiddenWorld {
@@ -85,11 +87,10 @@ export class HiddenWorld {
   async buildSettlement() {
     await this.third.buildSettlement();
     const settlement=await buildStarSettlement((x,z)=>this.height(x,z));
-    this.collision=settlement.collision;this.root.add(settlement.root);
+    // Every World II collider, without meshes: the same registration the server bakes.
+    this.collision=layoutStarhaven((x,z)=>this.height(x,z),settlement.natureNames).col;this.root.add(settlement.root);
     this.wind=new StarWind(settlement.root.getObjectByName('star-island-forests')!);
-    for(const o of this.obstacles)this.collision.addCircle(o.x,o.z,o.r,this.height(o.x,o.z),this.height(o.x,o.z)+12);
-    for(const o of this.crystalSolids)this.collision.addCircle(o.x,o.z,o.r,o.y0,o.y1);
-    this.life=new StarVillageLife((x,z)=>this.height(x,z),this.collision);this.root.add(this.life.root);
+    this.life=new StarVillageLife((x,z)=>this.height(x,z));this.root.add(this.life.root);
     const waystones=new StarWaystoneKit(),memorySeals=new StarMemorySealKit(),ore=new StarOreKit();
     for(const [kind,point] of Object.entries(STAR_OBJECTIVES)) {
       if(kind.startsWith('explore-')){
@@ -108,10 +109,8 @@ export class HiddenWorld {
       // Core stays in world coordinates for the existing channel/VFX and camera-fade paths.
       if(waystone){
         waystone.root.remove(mesh);this.root.add(waystone.root);
-        this.collision.addCircle(position.x,position.z,.88,position.y,position.y+3.15);
       }else if(mineral){
         this.root.add(mineral.root);
-        this.collision.addCircle(position.x,position.z,1.05,position.y,position.y+.4);
       }
       mesh.position.copy(position).y+=waystone?1.46:1.3;mesh.castShadow=true;
       const shadowOpacity={value:1};mesh.customDepthMaterial=collectibleShadow(shadowOpacity);this.root.add(mesh);
@@ -157,23 +156,17 @@ export class HiddenWorld {
     const stone=new THREE.MeshStandardMaterial({color:'#3c3b57',roughness:.78,metalness:.3});
     const crystal=new THREE.MeshStandardMaterial({color:'#a57bff',emissive:'#6524c9',emissiveIntensity:1.5,metalness:.5,roughness:.2});
     const teal=new THREE.MeshStandardMaterial({color:'#b0fff1',emissive:'#26afba',emissiveIntensity:1.3,metalness:.6,roughness:.25});
-    const rand=(i:number)=>{const x=Math.sin(i*127.1+41.7)*43758.5453;return x-Math.floor(x);};
     // Jagged crystal gardens frame the open combat paths. One geometry/material per family.
     const crystalFaces=crystal.clone();crystalFaces.vertexColors=true;crystalFaces.flatShading=true;crystalFaces.emissiveIntensity=.45;crystalFaces.metalness=.35;crystalFaces.roughness=.3;
-    const crystals=new THREE.InstancedMesh(facetedStarCrystal(),crystalFaces,90);crystals.name='star-island-crystal-gardens';const matrix=new THREE.Matrix4();const q=new THREE.Quaternion();
-    for(let i=0;i<90;i++){
-      const a=rand(i+1)*Math.PI*2,r=58+rand(i+120)*48,x=Math.sin(a)*r,z=10+Math.cos(a)*r,h=1.5+rand(i+250)*6,width=.7+rand(i+300),scale=new THREE.Vector3(width,h,1);
-      q.setFromEuler(new THREE.Euler(rand(i)*.25,a,.15));
-      const radius=Math.max(Math.max(width,1)+h*.15,starCrystalRadius(crystals.geometry,scale,q));
-      const clear=Math.abs(x)<55&&z>0&&z<104 || Math.hypot(x,z+75)<27 || starTrailDistance(x,z)<radius+2 || nearStarObjective(x,z,radius);
-      if(clear)matrix.makeScale(0,0,0);
+    const crystals=new THREE.InstancedMesh(facetedStarCrystal(),crystalFaces,90);crystals.name='star-island-crystal-gardens';const matrix=new THREE.Matrix4();
+    starCrystalGarden((x,z)=>this.height(x,z)).forEach((c,i)=>{
+      if(c.clear)matrix.makeScale(0,0,0);
       else{
-        const y=this.height(x,z);
-        matrix.compose(new THREE.Vector3(x,y+h*.5,z),q,scale);
-        this.crystalSolids.push({x,z,r:radius,y0:y-.5,y1:y+h*1.6});
+        matrix.compose(new THREE.Vector3(c.x,c.y+c.h*.5,c.z),c.q,c.scale);
+        this.crystalSolids.push(c.solid);
       }
       crystals.setMatrixAt(i,matrix);
-    }
+    });
     crystals.castShadow=true;this.root.add(crystals);
     this.throne=new StarThrone((x,z)=>this.height(x,z),stone,teal,crystal);
     this.root.add(this.throne.root);this.obstacles.push(...this.throne.solids);
@@ -224,11 +217,7 @@ export class HiddenWorld {
     g.cinematic=false;g.journey?.closeChapterEnding();
     this.baseRoot.visible=false;this.root.visible=true;
     w.heightAt=(x,z)=>this.height(x,z);
-    w.resolveCollision=(x,z,r,out)=>{
-      const d=Math.hypot(x/110,(z-10)/132);if(d>.91){x*=.91/d;z=10+(z-10)*.91/d;}
-      for(const o of this.obstacles){const dx=x-o.x,dz=z-o.z,dist=Math.hypot(dx,dz),min=r+o.r;if(dist<min){x=o.x+(dx/(dist||1))*min;z=o.z+(dz/(dist||1))*min;}}
-      return this.collision?.resolve(x,z,r,out)??out.set(x,z);
-    };
+    w.resolveCollision=(x,z,r,out)=>resolveOnIsland(this.collision,STAR_BOUNDS,this.obstacles,x,z,r,out);
     w.raycastSolid=(from,to)=>this.collision?.raycast(from,to)??null;
     if(!this.basePois.size)for(const [id,poi] of Object.entries(w.pois))this.basePois.set(id,{position:poi.position.clone(),yaw:poi.yaw});
     if(!this.basePeople.length)this.basePeople=[...g.npcs.map(n=>n.poi.position.clone()),...g.townsfolk.map(t=>t.unit.pos.clone())];
@@ -276,7 +265,7 @@ export class HiddenWorld {
     g.ending.cancel();g.hud.dialogue.close();g.hud.messages.closeDiscovery();
     this.chapter=3;this.rendered=true;this.baseRoot.visible=false;this.root.visible=false;this.third.root.visible=true;this.resetPortalArrival();
     const w=g.world,third=this.third;w.heightAt=(x,z)=>third.height(x,z);
-    w.resolveCollision=(x,z,r,out)=>{const d=Math.hypot(x/122,(z-3)/149);if(d>.81){x*=.81/d;z=3+(z-3)*.81/d;}return third.collision.resolve(x,z,r,out);};w.raycastSolid=(a,b)=>third.collision.raycast(a,b);
+    w.resolveCollision=(x,z,r,out)=>resolveOnIsland(third.collision,DAWN_BOUNDS,[],x,z,r,out);w.raycastSolid=(a,b)=>third.collision.raycast(a,b);
     w.pois.spawn.position.copy(third.spawn);w.pois.spawn.yaw=Math.PI;
     for(const [id,x,z] of [['forge',20,64],['chapel',16,48],['tavern',-20,64],['grove',-55,36],['shore',55,36],['wreck',55,-25],['lighthouse',0,-40],['beacon',0,-44],['bossArena',0,-72]] as const)w.pois[id].position.set(x,third.height(x,z),z);
     g.npcs.forEach((n,i)=>{const [x,z]=third.town[i];n.poi.position.set(x,third.height(x,z),z);n.unit.hidden=false;n.unit.teleport(w,x,z,Math.PI);});

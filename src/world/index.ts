@@ -3,7 +3,7 @@ import * as THREE from 'three';
 import { initAssets } from '../core/assets';
 import type { CreateWorld, Poi, PoiId, SpawnArea, World } from './types';
 import { TownBuilder } from './buildings';
-import { Collision } from './collision';
+import { layoutClawhaven } from './colliders';
 import { buildDressing } from './dressing';
 import { buildFoliage } from './foliage';
 import { buildFx } from './fx';
@@ -27,6 +27,8 @@ export const createWorld: CreateWorld = async ({ renderer, scene, quality, onPro
 
   progress(0.02, 'Shaping the Tidelands');
   const terrain = new Terrain();
+  // Colliders first, without meshes: the same registration the server bakes.
+  const { col, fountainY, wreck: wreckLayout, foliage: scattered } = layoutClawhaven(terrain, quality);
   await tick();
 
   progress(0.1, 'Unpacking the village');
@@ -64,8 +66,6 @@ export const createWorld: CreateWorld = async ({ renderer, scene, quality, onPro
   const sky = createSky(skyU);
   root.add(sky);
 
-  const col = new Collision(terrain);
-
   progress(0.45, 'Raising Clawhaven');
   const windowGlass = new THREE.MeshStandardMaterial({
     name: 'cc-window',
@@ -76,26 +76,26 @@ export const createWorld: CreateWorld = async ({ renderer, scene, quality, onPro
     side: THREE.DoubleSide,
   });
   const townBatch = new StaticBatch(village, 'town');
-  const town = new TownBuilder(village, townBatch, col, { MI_WindowGlass: windowGlass });
+  const town = new TownBuilder(village, townBatch, null, { MI_WindowGlass: windowGlass });
   for (const lot of LOTS) town.build(lot);
   root.add(townBatch.build());
 
   progress(0.55, 'Casting the Pincer Fountain');
-  const fountain = buildFountain(0, POI_DEFS.spawn ? terrain.heightAt(0, 0) : 4, 0, village.material('MI_Brick')!, skyU, col);
+  const fountain = buildFountain(0, fountainY, 0, village.material('MI_Brick')!, skyU);
   root.add(fountain.group);
 
   progress(0.6, 'Building Saltmere Lighthouse');
-  const lighthouse = buildLighthouse(village, col, windowGlass);
+  const lighthouse = buildLighthouse(village, windowGlass);
   root.add(lighthouse.group);
 
   progress(0.65, 'Sinking the Iron Wreck');
   const propBatch = new StaticBatch(props, 'props');
   const dressBatch = new StaticBatch(village, 'village-dressing');
-  const wreck = buildWreck(col, townBatch, propBatch);
+  const wreck = buildWreck(wreckLayout, townBatch, propBatch);
   root.add(wreck.group);
 
   progress(0.7, 'Setting out the market');
-  const dressing = buildDressing(village, props, terrain, col, propBatch, dressBatch, skyU);
+  const dressing = buildDressing(village, props, terrain, propBatch, dressBatch, skyU);
   root.add(dressing.group);
   const doorGlows = town.doorLamps.map((d) => {
     propBatch.add('Lantern_Wall', trs(d.pos.x, d.pos.y, d.pos.z, d.yaw, 0.75));
@@ -110,7 +110,7 @@ export const createWorld: CreateWorld = async ({ renderer, scene, quality, onPro
   root.add(dressBatch.build());
 
   progress(0.72, 'Growing the pine woods');
-  const foliage = buildFoliage(nature, terrain, col, quality);
+  const foliage = buildFoliage(nature, scattered, quality);
   root.add(foliage.group);
 
   const water = createWater(
@@ -122,8 +122,6 @@ export const createWorld: CreateWorld = async ({ renderer, scene, quality, onPro
   );
   (water.mesh.material as THREE.ShaderMaterial).uniforms.uTime = uTime;
   root.add(water.mesh);
-
-  col.buildBlocked();
 
   // Ambient particles.
   const fountainCentre = new THREE.Vector3(0, fountain.waterY, 0);

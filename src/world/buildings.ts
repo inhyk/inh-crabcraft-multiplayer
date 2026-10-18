@@ -41,20 +41,25 @@ type Side = 'front' | 'back' | 'left' | 'right';
 
 const ROOF_LENGTHS: Record<number, number[]> = { 4: [4, 6, 8], 6: [6, 8, 10, 12, 14], 8: [8, 10, 12, 14] };
 
+/**
+ * Builds lots twice over the same code: with a batch it places the kit pieces, with a collision it
+ * registers each footprint. Either may be null, so colliders can be built without the kit.
+ */
 export class TownBuilder {
   readonly lights: LightSpot[] = [];
   /** Wall anchors (world) and facing yaw for lanterns beside doors. */
   readonly doorLamps: { pos: THREE.Vector3; yaw: number }[] = [];
   private m = new THREE.Matrix4();
   constructor(
-    readonly kit: Kit,
-    readonly batch: StaticBatch,
-    readonly col: Collision,
+    readonly kit: Kit | null,
+    readonly batch: StaticBatch | null,
+    readonly col: Collision | null,
     readonly glassOverride: Record<string, THREE.Material>,
   ) {}
 
   /** Place a piece in building-local coordinates. */
   private put(base: THREE.Matrix4, piece: string, x: number, y: number, z: number, yaw = 0, scale: number | THREE.Vector3 = 1, override?: Record<string, THREE.Material>): void {
+    if (!this.batch) return;
     this.m.multiplyMatrices(base, trs(x, y, z, yaw, scale));
     this.batch.add(piece, this.m, { override: override ?? this.glassOverride });
   }
@@ -118,7 +123,7 @@ export class TownBuilder {
     if (!o.noRoof) this.roof(base, W, D, top, o, r);
     // Collision: the whole footprint.
     const yaw = new THREE.Euler().setFromRotationMatrix(base).y;
-    this.col.addBox(lotPos.x, lotPos.z, W / 2 + 0.15, D / 2 + 0.15, yaw, lotPos.y - 2, lotPos.y + top + 6);
+    this.col?.addBox(lotPos.x, lotPos.z, W / 2 + 0.15, D / 2 + 0.15, yaw, lotPos.y - 2, lotPos.y + top + 6);
   }
 
   private wall(

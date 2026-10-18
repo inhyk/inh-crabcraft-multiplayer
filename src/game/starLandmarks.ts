@@ -2,6 +2,23 @@ import * as THREE from 'three';
 import type { Collision } from '../world/collision';
 import {facetedStarCrystal,starCrystalRadius} from './starCrystal';
 
+/** Moonshade's six crystal leaves around the glade. */
+function moonshadeLeaves(){
+  return Array.from({length:6},(_,i)=>{
+    const a=i/6*Math.PI*2,x=-75+Math.cos(a)*7.7,z=-35+Math.sin(a)*7.7,h=3.5+(i%3)*1.1;
+    return {x,z,h,rotation:new THREE.Quaternion().setFromEuler(new THREE.Euler(Math.sin(a)*.12,a,Math.cos(a)*.12)),scale:new THREE.Vector3(1.1,h,.85)};
+  });
+}
+const SANCTUARY_PILLARS=[[0,-4.8,-55],[1,4.8,-55],[2,-8,-47],[3,8,-47]] as const;
+
+/** Crystal leaves and sanctuary pillars block movement; the glade and the arch stay open. */
+export function registerStarLandmarks(height:(x:number,z:number)=>number,collision:Collision){
+  const geometry=facetedStarCrystal();
+  for(const {x,z,h,rotation,scale} of moonshadeLeaves())collision.addCircle(x,z,Math.max(1.2,starCrystalRadius(geometry,scale,rotation)),height(x,z),height(x,z)+h*1.7);
+  geometry.dispose();
+  for(const [,x,z] of SANCTUARY_PILLARS){const y=height(x,z);collision.addCircle(x,z,1,y,y+6.4);}
+}
+
 /** Distinct silhouettes at the three memories; the middle stays open for players and quest markers. */
 export class StarLandmarks {
   readonly root=new THREE.Group();
@@ -9,7 +26,7 @@ export class StarLandmarks {
   private mist:THREE.Points;
   private northernStar:THREE.Mesh;
 
-  constructor(height:(x:number,z:number)=>number,collision:Collision){
+  constructor(height:(x:number,z:number)=>number){
     this.root.name='star-island-landmarks';
     const stone=new THREE.MeshStandardMaterial({color:'#686c83',roughness:.85,metalness:.15});
     const paleStone=new THREE.MeshStandardMaterial({color:'#b2b1bd',roughness:.7,metalness:.2});
@@ -27,13 +44,9 @@ export class StarLandmarks {
     // Moonshade: six enormous blue crystal leaves frame a quiet, walkable glade.
     const crystalFaces=cyan.clone();crystalFaces.vertexColors=true;crystalFaces.flatShading=true;crystalFaces.emissiveIntensity=.45;crystalFaces.metalness=.35;crystalFaces.roughness=.3;
     const crystals=new THREE.InstancedMesh(facetedStarCrystal(),crystalFaces,6);crystals.name='moonshade-crystal-leaves';
-    for(let i=0;i<6;i++){
-      const a=i/6*Math.PI*2,x=-75+Math.cos(a)*7.7,z=-35+Math.sin(a)*7.7,h=3.5+(i%3)*1.1;
-      rotation.setFromEuler(new THREE.Euler(Math.sin(a)*.12,a,Math.cos(a)*.12));
-      const scale=new THREE.Vector3(1.1,h,.85);
+    moonshadeLeaves().forEach(({x,z,h,rotation,scale},i)=>{
       matrix.compose(new THREE.Vector3(x,height(x,z)+h*.55,z),rotation,scale);crystals.setMatrixAt(i,matrix);
-      collision.addCircle(x,z,Math.max(1.2,starCrystalRadius(crystals.geometry,scale,rotation)),height(x,z),height(x,z)+h*1.7);
-    }
+    });
     crystals.castShadow=true;this.root.add(crystals);
     // Memory Sanctuary: a carved arch sits beyond the discovery circle, leaving the road open.
     const pillars=new THREE.InstancedMesh(new THREE.CylinderGeometry(.58,.7,5.7,12),paleStone,4);
@@ -44,8 +57,8 @@ export class StarLandmarks {
     bands.name='sanctuary-column-bands';
     const glyphs=new THREE.InstancedMesh(new THREE.OctahedronGeometry(.14),violet,12);
     glyphs.name='sanctuary-column-glyphs';
-    for(const [i,x,z] of [[0,-4.8,-55],[1,4.8,-55],[2,-8,-47],[3,8,-47]]){
-      const y=height(x,z);pillars.setMatrixAt(i,new THREE.Matrix4().makeTranslation(x,y+3.2,z));collision.addCircle(x,z,1,y,y+6.4);
+    for(const [i,x,z] of SANCTUARY_PILLARS){
+      const y=height(x,z);pillars.setMatrixAt(i,new THREE.Matrix4().makeTranslation(x,y+3.2,z));
       for(let j=0;j<2;j++){
         rotation.setFromAxisAngle(new THREE.Vector3(1,0,0),j*Math.PI);
         matrix.compose(new THREE.Vector3(x,y+(j?6.225:.175),z),rotation,new THREE.Vector3(1,1,1));capitals.setMatrixAt(i*2+j,matrix);

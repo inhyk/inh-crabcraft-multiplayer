@@ -2,6 +2,7 @@
 // rendered as one mesh with a splat-painted stylised material (grass, sand, dirt, cobble, rock).
 import * as THREE from 'three';
 import {voyageDistance,islandHeight} from './voyage';
+import { gridHeight } from '../sim/world/ground';
 import { clamp, lerp, Simplex, smoothstep } from './noise';
 import {
   COAST,
@@ -269,19 +270,7 @@ export class Terrain {
 
   /** Exact height of the rendered triangle mesh at x,z. */
   heightAt(x: number, z: number): number {
-    const fi = (x - this.minX) / this.step;
-    const fj = (z - this.minZ) / this.step;
-    if (fi < 0 || fj < 0 || fi >= this.nx - 1 || fj >= this.nz - 1) return -20;
-    const i = Math.floor(fi);
-    const j = Math.floor(fj);
-    const u = fi - i;
-    const v = fj - j;
-    const k = j * this.nx + i;
-    const h = this.h;
-    // Triangles split along the (i+1, j) - (i, j+1) diagonal, matching buildMesh().
-    if (u + v <= 1) return h[k] + (h[k + 1] - h[k]) * u + (h[k + this.nx] - h[k]) * v;
-    const h11 = h[k + this.nx + 1];
-    return h11 + (h[k + this.nx] - h11) * (1 - u) + (h[k + 1] - h11) * (1 - v);
+    return gridHeight(this, x, z);
   }
 
   /** Coast distance (bilinear). */
