@@ -1,0 +1,25 @@
+name: Simulation checks
+on:
+  pull_request:
+    branches: [dev, main]
+permissions:
+  contents: read
+jobs:
+  simulation:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 10.10.0
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build
+      - run: pnpm test:sim
+      - run: pnpm test:boss
+      - run: pnpm test:engine
+      - run: pnpm test:multiplayer
+      - run: pnpm test:server

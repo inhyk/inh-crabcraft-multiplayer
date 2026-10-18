@@ -1,22 +1,19 @@
 // The player's crab: WASD movement with acceleration, WoW-style turning and steering, jumping,
-// targeting, auto-attack, the cast/channel bars, resources, cooldowns and the global cooldown.
+// targeting, auto-attack, casts and channels, resources, cooldowns and the global cooldown. What the
+// player sees and hears of it (cast bar, errors, XP, effects) leaves as events (src/game/events.ts).
+// Keyboard, mouse and camera are still read here; S2 splits them off into an input layer.
 import * as THREE from 'three';
-import {t} from '../i18n';
-import {abilityName} from './abilityLocale';
 import type { AbilityDef, ClassDef } from '../data/classes';
 import type { Game } from './game';
-import type { Unit } from './unit';
+import { lineOfSight, type Unit } from './unit';
 import { executeAbility, abilityNeedsTarget, isMeleeAbility } from './abilities';
 import { BreakRoutine } from './breakdance';
-import { rollCrit, CRIT_MULT } from './combat';
-import { C, N, type WardHandle } from './vfx/vfx';
-import { Sprite } from './vfx/atlas';
+import { rollCrit, CRIT_MULT, type CombatController } from './combat';
+import { v3, type ErrorReason, type Label } from './events';
 import { angleDiff, damp, dampAngle, rand, turnToward, yawTo } from './util';
 
 /** Window of the recorded jump clip that is played: crouch, take-off (1.08 s), landing (1.37 s). */
-const JUMP_FROM = 0.8;
-const JUMP_TO = 1.56;
-const JUMP_RATE = 1.15;
+export const JUMP_CLIP = { from: 0.8, to: 1.56, speed: 1.15 };
 
 export const GCD = 1.0;
 import { xpForLevel, levelForXp } from './progression';
@@ -38,7 +35,7 @@ export interface CastState {
 }
 
 export interface ChannelState {
-  label: string;
+  label: Label;
   start: number;
   end: number;
   key: string;
@@ -46,7 +43,7 @@ export interface ChannelState {
   onDone: () => void;
 }
 
-export class Player {
+export class Player implements CombatController {
   resource = 0;
   maxResource = 100;
   xp = 0;
@@ -58,7 +55,8 @@ export class Player {
   cast: CastState | null = null;
   channel: ChannelState | null = null;
   target: Unit | null = null;
-  ward: WardHandle | null = null;
+  /** Barnacle Ward is up (its absorb lives on the unit). */
+  warded = false;
   private nextSwing = 0;
   private lastAttack = -10;
   private queued: AbilityDef | null = null;
@@ -78,8 +76,9 @@ export class Player {
 
   constructor(private readonly game: Game, readonly unit: Unit, readonly cls: ClassDef) {
     this.breakdance = new BreakRoutine(unit, {
-      onEvent: (name, step) => this.onBreakEvent(name, step.id),
+      onEvent: (name, step) => this.game.events.emit({ type: 'dance', unit, stage: 'moment', moment: name, move: step.id }),
     });
+    unit.ctrl = this;
     this.baseMaxHp = cls.baseHp;
     unit.maxHp = unit.hp = cls.baseHp;
     if (cls.resource === 'mana') this.maxResource = this.resource = 120;
@@ -111,7 +110,7 @@ export class Player {
     this.resource = Math.min(this.maxResource, this.resource + n);
   }
 
-  onDamaged(dmg: number): void {
+  onHurt(dmg: number): void {
     this.breakdance.cancel(0.12);
     if (this.isRage) this.gainRage(dmg * 0.5);
     if (this.cast && this.cast.ability.castTime > 0) {
@@ -120,13 +119,13 @@ export class Player {
     }
   }
 
-  onWardHit(dst: Unit, broken: boolean): void {
-    if (dst !== this.unit || !this.ward) return;
+  onWardHit(broken: boolean): void {
+    if (!this.warded) return;
     if (broken) {
-      this.ward.pop();
-      this.ward = null;
-      dst.absorb = 0;
-    } else this.ward.hit();
+      this.warded = false;
+      this.unit.absorb = 0;
+    }
+    this.game.events.emit({ type: 'ward', unit: this.unit, stage: broken ? 'down' : 'hit' });
   }
 
   // ---------------------------------------------------------------- per frame
@@ -183,7 +182,7 @@ export class Player {
       u.setYaw(turnToward(u.yaw, yawTo(u.pos.x, u.pos.z, t.pos.x, t.pos.z), 9, dt));
     }
     // Turn to the crab you are talking to, so the dialogue shot looks over your shoulder at it.
-    const talk = g.hud.dialogue.unit;
+    const talk = g.talkPartner;
     if (talk && !moving && !turn && !g.follow.steering && !stunned && !this.dash) {
       u.setYaw(turnToward(u.yaw, yawTo(u.pos.x, u.pos.z, talk.pos.x, talk.pos.z), 4.5, dt));
     }
@@ -192,21 +191,9 @@ export class Player {
     if (free && inp.wasPressed('Space') && this.jumpT <= 0 && !stunned && !this.dash) {
       // The recorded jump rollout spends 1.08 s getting ready before take-off and another 2 s
       // settling after landing. Play only crouch, flight and landing, a little faster, so the
-      // crab leaves the ground at once and walks on as soon as it lands.
-      this.jumpT = (JUMP_TO - JUMP_FROM) / JUMP_RATE;
-      u.act('jump', {
-        fade: 0.06,
-        from: JUMP_FROM,
-        to: JUMP_TO,
-        speed: JUMP_RATE,
-        onEvent: (name) => {
-          if (name === 'land') {
-            const sand = g.zone === 'The Brine Shore' || g.zone === 'The Iron Wreck';
-            g.audio.sfx(sand ? 'sfx-footstep-sand' : 'sfx-footstep-stone', { volume: 0.45, pitch: 0.08 });
-          }
-        },
-      });
-      g.audio.sfx('sfx-servo-whir', { volume: 0.35 });
+      // crab leaves the ground at once and walks on as soon as it lands (the sink plays JUMP_CLIP).
+      this.jumpT = (JUMP_CLIP.to - JUMP_CLIP.from) / JUMP_CLIP.speed;
+      g.events.emit({ type: 'jump', unit: u });
       if (this.cast && this.cast.ability.castTime > 0) this.interruptCast();
       if (this.channel) this.cancelChannel();
     }
@@ -268,7 +255,7 @@ export class Player {
       u.footstepT -= dt * speed / WALK_SPEED;
       if (u.footstepT <= 0) {
         u.footstepT = 0.34;
-        g.audio.sfx(g.zone === 'The Brine Shore' || g.zone === 'The Iron Wreck' ? 'sfx-footstep-sand' : 'sfx-footstep-stone', { volume: 0.22, pitch: 0.12 });
+        g.events.emit({ type: 'footstep', unit: u });
       }
     }
 
@@ -285,19 +272,16 @@ export class Player {
     if (t && (t.hidden || (!t.alive && now - this.targetDeadAt > 1.5))) this.setTarget(null);
     if (t && !t.alive && this.targetDeadAt === 0) this.targetDeadAt = now;
 
-    // Cast bar
+    // Cast bar (the motes at the claw are drawn from this state, src/game/browserSink.ts)
     if (this.cast) {
       const c = this.cast;
-      const claw = u.socketPos('clawR', v1);
-      const col = c.ability.id === 'smite' || c.ability.id === 'mend-shell' ? (c.ability.id === 'smite' ? C.holy : C.heal) : C.water;
-      g.vfx.castMotes(claw, col, c.ability.id === 'mend-shell' ? Sprite.Star : Sprite.Glow);
       if (c.target && !c.target.alive) {
         this.interruptCast('Invalid target');
       } else if (now >= c.end) {
         this.cast = null;
         // The channel hands over to the cast's release: the claws fling wide as the spell goes.
         u.act('cast', { upper: true, part: 'release', fade: 0.1 });
-        g.hud.castBar.finish();
+        g.events.emit({ type: 'castEnd', unit: u, channel: false, result: 'done' });
         if (c.target && abilityNeedsTarget(c.ability) && !this.checkReach(c.ability, c.target)) return;
         this.commit(c.ability, c.target);
       }
@@ -308,15 +292,11 @@ export class Player {
       const ch = this.channel;
       if (!g.input.isDown(ch.key)) {
         this.cancelChannel();
-      } else {
-        const claw = u.socketPos('clawR', v1);
-        g.vfx.beaconStream(claw, ch.to, (now - ch.start) / (ch.end - ch.start));
-        if (now >= ch.end) {
-          this.channel = null;
-          u.act('cast', { upper: true, part: 'release', fade: 0.1 });
-          g.hud.castBar.finish();
-          ch.onDone();
-        }
+      } else if (now >= ch.end) {
+        this.channel = null;
+        u.act('cast', { upper: true, part: 'release', fade: 0.1 });
+        g.events.emit({ type: 'castEnd', unit: u, channel: true, result: 'done' });
+        ch.onDone();
       }
     }
 
@@ -340,7 +320,7 @@ export class Player {
               const crit = rollCrit();
               const dmg = rand(8, 11) * this.dmgMul * (crit ? CRIT_MULT : 1);
               g.combat.damage(u, t, dmg, { crit, rage: crit ? 15 : 9 });
-              g.vfx.slash(u, t, C.steel, 0.8);
+              g.events.emit({ type: 'attack', src: u, attack: 'auto', stage: 'hit', target: t });
             },
           });
         }
@@ -349,7 +329,7 @@ export class Player {
         this.lastAttack = now;
         const from = u.socketPos('clawR', v1).clone();
         const style = this.cls.id === 'priest' ? 'holy' : 'spark';
-        g.vfx.projectile(from, t, style, 22, () => {
+        g.projectiles.spawn(u, from, t, style, 22, () => {
           if (!t.alive) return;
           const crit = rollCrit();
           g.combat.damage(u, t, rand(5, 7) * this.dmgMul * (crit ? CRIT_MULT : 1), { crit, school: style === 'holy' ? 'holy' : 'frost', noReact: true });
@@ -377,8 +357,7 @@ export class Player {
     }
     if (u.absorb > 0 && now >= u.absorbUntil) {
       u.absorb = 0;
-      this.ward?.pop();
-      this.ward = null;
+      this.dropWard();
     }
   }
 
@@ -400,18 +379,13 @@ export class Player {
     this.velX = this.velZ = 0;
     this.breakdance.start();
     u.express('happy', 3);
-    g.hud.messages.info(t('브레이크댄스: 탑록, 식스스텝, 스핀, 720, 백플립, 한 집게 프리즈. 움직이면 멈춰요.', 'Breakdance: toprock, six-step, spin, 720, back flip, one-claw freeze. Move to stop.'));
+    g.events.emit({ type: 'dance', unit: u, stage: 'start' });
   }
 
-  /** The routine's moments: a whir on every take-off, a thud on every landing and freeze. */
-  private onBreakEvent(name: string, id: string): void {
-    const g = this.game;
-    const sand = g.zone === 'The Brine Shore' || g.zone === 'The Iron Wreck';
-    if (name === 'takeoff' || (name === 'spin_from' && id === 'break_spin')) g.audio.sfx('sfx-servo-whir', { volume: 0.4 });
-    else if (name === 'land' || (name === 'hit' && id === 'break_oneclaw')) {
-      g.audio.sfx(sand ? 'sfx-footstep-sand' : 'sfx-footstep-stone', { volume: 0.55, pitch: 0.08 });
-      this.unit.express('love', 1.2);
-    }
+  private dropWard(): void {
+    if (!this.warded) return;
+    this.warded = false;
+    this.game.events.emit({ type: 'ward', unit: this.unit, stage: 'down' });
   }
 
   // ---------------------------------------------------------------- abilities
@@ -423,7 +397,7 @@ export class Player {
     if (!ab || !u.alive || g.controlsLocked || g.villageGames?.playing) return;
     this.breakdance.cancel(0.12);
     const now = g.time;
-    g.hud.actionBar.press(slot);
+    g.events.emit({ type: 'press', unit: u, slot });
     if (u.stunned(now)) return this.error('You are stunned.');
     if (this.channel) return this.error('Another action is in progress.');
     if (this.cast) {
@@ -451,8 +425,7 @@ export class Player {
     if (ab.castTime > 0) {
       this.cast = { ability: ab, start: now, end: now + ab.castTime, target };
       u.act('cast', { upper: true, loop: true, fade: 0.15 });
-      g.audio.sfx('sfx-cast', { volume: 0.5 });
-      g.hud.castBar.start(() => abilityName(ab), ab.castTime);
+      g.events.emit({ type: 'castStart', unit: u, seconds: ab.castTime, ability: ab });
     } else {
       this.commit(ab, target);
     }
@@ -461,7 +434,7 @@ export class Player {
   private checkReach(ab: AbilityDef, t: Unit): boolean {
     const u = this.unit;
     const d = u.distTo(t) - t.radius;
-    let err = '';
+    let err: ErrorReason | '' = '';
     if (isMeleeAbility(ab)) err = u.gapTo(t) > MELEE_GAP + 0.3 ? 'Out of range.' : '';
     else if (d > ab.range) err = 'Out of range.';
     else if (ab.id === 'sideways-charge' && u.gapTo(t) < 2) err = 'Target too close.';
@@ -471,10 +444,7 @@ export class Player {
   }
 
   lineOfSight(t: Unit): boolean {
-    const from = v1.set(this.unit.pos.x, this.unit.pos.y + this.unit.height * 0.8, this.unit.pos.z);
-    const to = t.centre(v2);
-    const hit = this.game.world.raycastSolid(from, to);
-    return hit === null || hit >= from.distanceTo(to) - t.radius - 0.3;
+    return lineOfSight(this.game.world, this.unit, t);
   }
 
   /** Pay, start the cooldown, run the ability. */
@@ -493,25 +463,23 @@ export class Player {
     if (!this.cast) return;
     this.cast = null;
     this.unit.motion.stop('cast', 0.15);
-    const ko:Record<string,string>={Interrupted:'중단됨',Cancelled:'취소됨','Invalid target':'대상을 다시 선택하세요'};
-    this.game.hud.castBar.fail(() => t(ko[reason]??reason,reason));
+    this.game.events.emit({ type: 'castEnd', unit: this.unit, channel: false, result: 'interrupted', reason });
   }
 
-  startChannel(label: string, seconds: number, key: string, to: THREE.Vector3, onDone: () => void): void {
+  startChannel(label: Label, seconds: number, key: string, to: THREE.Vector3, onDone: () => void): void {
     if (this.cast) this.interruptCast();
     const now = this.game.time;
     this.channel = { label, start: now, end: now + seconds, key, to, onDone };
     this.velX = this.velZ = 0;
     this.unit.act('cast', { upper: true, loop: true, fade: 0.2 });
-    this.game.hud.castBar.start(label, seconds, true);
-    this.game.audio.sfx('sfx-cast', { volume: 0.5 });
+    this.game.events.emit({ type: 'castStart', unit: this.unit, seconds, channel: { label, to: v3(to), start: now, end: now + seconds } });
   }
 
   cancelChannel(): void {
     if (!this.channel) return;
     this.channel = null;
     this.unit.motion.stop('cast', 0.2);
-    this.game.hud.castBar.fail(() => t('중단됨','Interrupted'));
+    this.game.events.emit({ type: 'castEnd', unit: this.unit, channel: true, result: 'interrupted', reason: 'Interrupted' });
   }
 
   // Ability helpers used by abilities.ts
@@ -519,7 +487,6 @@ export class Player {
   startDash(target: Unit): void {
     this.dash = { target, t: 0 };
     this.velX = this.velZ = 0;
-    this.game.vfx.dashTrail(this.unit, 0.5);
   }
 
   private updateDash(dt: number): void {
@@ -536,10 +503,7 @@ export class Player {
       this.dash = null;
       u.lift = 0;
       const g = this.game;
-      g.vfx.impact(t.centre(v1), C.steel, 1.2);
-      g.vfx.ring(t.pos, N.gold, 0.3, 2.2, 0.35, 0.8);
-      g.follow.shake(0.12, 0.2);
-      g.audio.sfx('sfx-hit', { volume: 0.8 });
+      g.events.emit({ type: 'ability', caster: u, ability: 'sideways-charge', stage: 'hit', target: t });
       this.nextSwing = Math.min(this.nextSwing, g.time + 0.1);
       return;
     }
@@ -553,23 +517,8 @@ export class Player {
     this.spinT = 0.6;
   }
 
-  error(msg: string): void {
-    const translations:Record<string,string>={
-      'You are stunned.':'기절한 동안에는 움직일 수 없어요.',
-      'Another action is in progress.':'다른 행동을 마친 뒤 사용하세요.',
-      'Ability is not ready yet.':'아직 기술을 다시 사용할 수 없어요.',
-      'Not enough rage.':'분노가 부족해요.',
-      'Not enough mana.':'마나가 부족해요.',
-      'You have no target.':'먼저 대상을 선택하세요.',
-      'Invalid target.':'이 대상에게는 사용할 수 없어요.',
-      'Out of range.':'조금 더 가까이 다가가세요.',
-      'Target too close.':'대상과 조금 더 거리를 두세요.',
-      'Target not in line of sight.':'대상이 장애물에 가려져 있어요.',
-      "You can't dance while in combat.":'전투 중에는 춤출 수 없어요.',
-      'Stand still to dance.':'멈춰 선 다음에 춤출 수 있어요.',
-    };
-    this.game.hud.messages.error(t(translations[msg]??msg,msg));
-    this.game.audio.sfx('sfx-error', { volume: 0.6 });
+  error(reason: ErrorReason): void {
+    this.game.events.emit({ type: 'error', unit: this.unit, reason });
   }
 
   // ---------------------------------------------------------------- targeting
@@ -578,8 +527,7 @@ export class Player {
     if (t === this.target) return;
     this.target = t;
     this.targetDeadAt = t && !t.alive ? this.game.time : 0;
-    this.game.hud.targetFrame.setUnit(t, t?.kind === 'npc' ? `art/npc/${t.npcId}.webp` : null);
-    if (t) this.game.audio.sfx('sfx-click', { volume: 0.35 });
+    this.game.events.emit({ type: 'target', unit: this.unit, target: t });
   }
 
   /** Nearest hostile in front of the camera; repeated presses cycle. */
@@ -627,10 +575,9 @@ export class Player {
     const g = this.game;
     if(!Number.isFinite(n) || n<=0)return;
     this.xp = Math.min(Number.MAX_SAFE_INTEGER,this.xp+n);
-    g.hud.floats.spawn(this.unit, `+${n} XP`, 'xp');
-    g.hud.chat.system(t(`경험치 ${n}을 얻었습니다.`,`You gain ${n} experience.`));
+    g.events.emit({ type: 'xp', unit: this.unit, amount: n });
     const targetLevel=levelForXp(this.xp);
-    if(targetLevel-this.level>10){this.restoreXp(this.xp);g.vfx.levelUp(this.unit);g.audio.sfx('sfx-levelup');g.hud.messages.banner(() => (t(`레벨 ${this.level}`,`Level ${this.level}`)),() => (t('계속해서 성장하세요!','Keep growing!')),'level');}
+    if(targetLevel-this.level>10){this.restoreXp(this.xp);g.events.emit({ type: 'levelUp', unit: this.unit, level: this.level, oldMaxHp: this.unit.maxHp, maxHp: this.unit.maxHp, jump: true });}
     else while (this.xp >= xpForLevel(this.unit.level+1)) this.levelUp();
   }
 
@@ -652,11 +599,8 @@ export class Player {
       this.maxResource = 120 + 20 * (u.level - 1);
       this.resource = this.maxResource;
     }
-    g.vfx.levelUp(u);
-    g.audio.sfx('sfx-levelup');
+    g.events.emit({ type: 'levelUp', unit: u, level: u.level, oldMaxHp: oldMax, maxHp: u.maxHp, jump: false });
     u.express('happy', 2);
-    g.hud.messages.banner(() => (t(`레벨 ${u.level}`,`Level ${u.level}`)),() => (t(`껍질이 더 단단해졌어요. 체력 ${oldMax} → ${u.maxHp}`,`Your shell hardens. Health ${oldMax} to ${u.maxHp}.`)),'level');
-    g.hud.chat.system(t(`레벨 ${u.level}이 되었습니다!`,`Congratulations, you have reached level ${u.level}!`));
   }
 
   returnToSquare(): void {
@@ -672,9 +616,7 @@ export class Player {
     this.setTarget(null);
     g.world2.resetPortalArrival();
     this.unit.teleport(g.world, x, z, spawn.yaw);
-    g.follow.yaw = this.unit.yaw + Math.PI;
-    g.follow.cut();
-    g.vfx.mendGlow(this.unit);
+    g.events.emit({ type: 'recall', unit: this.unit });
   }
 
   respawn(): void {
@@ -690,8 +632,7 @@ export class Player {
     u.rust = 0;
     u.absorb = 0;
     u.lift = 0;
-    this.ward?.pop();
-    this.ward = null;
+    this.dropWard();
     this.velX = this.velZ = 0;
     u.lastCombat = -1e9;
     this.breakdance.cancel(0);

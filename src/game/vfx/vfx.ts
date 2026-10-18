@@ -66,6 +66,11 @@ const v2 = new THREE.Vector3();
 const UP = new THREE.Vector3(0, 1, 0);
 const tilt = new THREE.Quaternion();
 
+export interface ProjectileFx {
+  /** The projectile reached its target (or the target died): splash and remove it. */
+  land(): void;
+}
+
 export interface WardHandle {
   hit(): void;
   pop(): void;
@@ -387,14 +392,11 @@ export class Vfx {
     this.add.emit({ x: at.x, y: at.y, z: at.z, life: 0.08, size: 0.45, color, sprite: Sprite.Glow, alpha: 0.6, fadeIn: 0 });
   }
 
-  /** Homing projectile. style picks the look. */
-  projectile(
-    from: THREE.Vector3,
-    target: Unit,
-    style: 'bubble' | 'spark' | 'holy' | 'rust',
-    speed: number,
-    onHit: () => void,
-  ): void {
+  /**
+   * A homing projectile, drawn only: it chases the target at the simulation's speed, and the
+   * simulation (src/game/projectiles.ts) says when it lands, which splashes it. style picks the look.
+   */
+  projectile(from: THREE.Vector3, target: Unit, style: 'bubble' | 'spark' | 'holy' | 'rust', speed: number): ProjectileFx {
     const pos = from.clone();
     const orb = style === 'bubble' ? this.fx.spawn('orb', Infinity) : null;
     if (orb) {
@@ -404,16 +406,14 @@ export class Vfx {
     }
     const color = style === 'bubble' ? C.water : style === 'holy' ? C.holy : style === 'rust' ? C.ember : C.frost;
     let wobble = 0;
-    const a = this.attach(6, (dt) => {
+    let landed = false;
+    // A little past the simulation's longest flight; its landing normally ends this first.
+    const a = this.attach(6.5, (dt) => {
       const dest = target.centre(v2);
       const d = v1.copy(dest).sub(pos);
       const len = d.length();
       const step = speed * dt;
-      if (len <= step || !target.alive) {
-        this.detach(a);
-        return;
-      }
-      pos.addScaledVector(d, step / len);
+      if (len > step && target.alive) pos.addScaledVector(d, step / len);
       wobble += dt * 18;
       if (orb) {
         orb.mesh.position.copy(pos);
@@ -437,11 +437,17 @@ export class Vfx {
       }
     }, () => {
       if (orb) this.fx.release(orb);
+      if (!landed) return;
       const at = target.centre(v2);
       if (style === 'bubble') this.bubbleSplash(at);
       else this.impact(at, color, 0.6);
-      onHit();
     });
+    return {
+      land: () => {
+        landed = true;
+        this.detach(a);
+      },
+    };
   }
 
   bubbleSplash(at: THREE.Vector3): void {

@@ -2,7 +2,7 @@
 // and the boss are all Units; their behaviour lives in separate controllers.
 import * as THREE from 'three';
 import type { CrabRig, Expression } from '../crab/types';
-import { isSkill, skillDelay, skillWindow, type SkillPart } from '../motion/skills';
+import { actionHitDelay, isSkill, skillWindow, type SkillPart } from '../motion/skills';
 import type { MotionController, MotionId } from '../motion/types';
 import type { World } from '../world/types';
 import { angleDiff, clamp, damp } from './util';
@@ -12,13 +12,14 @@ export type Reaction = 'hostile' | 'friendly' | 'neutral' | 'player';
 
 const tmpV = new THREE.Vector3();
 const tmp2 = new THREE.Vector2();
+const tmpTo = new THREE.Vector3();
 
 export interface ActionOptions {
   /** Claws only; the legs keep walking. */
   upper?: boolean;
   /**
-   * Seconds after start when onHit fires if the clip sends no 'hit' event (a clip still loading).
-   * Skill clips default to just after their own hit, so the clip's moment is what lands it.
+   * Seconds after start when onHit fires. Skill clips default to their own hit moment
+   * (src/motion/skills.ts actionHitDelay), other clips to 0.3 s. Game time decides it, not the clip.
    */
   hitAt?: number;
   onHit?: () => void;
@@ -40,6 +41,17 @@ export interface ActionOptions {
    * heading when it fades out (MotionPlayOptions.carryRoot), instead of being taken out.
    */
   carryRoot?: boolean;
+}
+
+/**
+ * Whether `to` can be seen from `from`'s eyes: nothing solid between them short of `to`'s own
+ * shell. Abilities check it from the caster, enemies from the player they hunt.
+ */
+export function lineOfSight(world: World, from: Unit, to: Unit): boolean {
+  const eye = tmpV.set(from.pos.x, from.pos.y + from.height * 0.8, from.pos.z);
+  const at = to.centre(tmpTo);
+  const hit = world.raycastSolid(eye, at);
+  return hit === null || hit >= eye.distanceTo(at) - to.radius - 0.3;
 }
 
 export class Unit {
@@ -199,7 +211,10 @@ export class Unit {
     return this.rig.getSocket(name).getWorldPosition(out);
   }
 
-  /** Play a clip; onHit fires on the clip's 'hit' event or after hitAt seconds, whichever is first. */
+  /**
+   * Play a clip. onHit fires on the game clock (updateHit) at the clip's hit moment from the skill
+   * data, or after hitAt seconds; the clip's own events never land a blow.
+   */
   act(id: MotionId, o: ActionOptions = {}): void {
     this.onAction?.(id);
     // A skill clip is the whole recorded rollout: play its move, at its rate, unless told otherwise.
@@ -207,8 +222,7 @@ export class Unit {
     if (o.onHit) {
       // A swing interrupted by the next one still lands.
       if (this.pendingHit) this.pendingHit.fn();
-      const own = w && isSkill(id) && o.from === undefined ? skillDelay(id, 'hit', w) : null;
-      this.pendingHit = { fn: o.onHit, left: o.hitAt ?? (own !== null ? own + 0.1 : 0.3) };
+      this.pendingHit = { fn: o.onHit, left: o.hitAt ?? actionHitDelay(id, o) ?? 0.3 };
     }
     if (id === 'death') this.deathT = 0;
     this.motion.play(id, {
@@ -219,14 +233,7 @@ export class Unit {
       from: o.from ?? w?.from,
       to: o.to ?? w?.to,
       loopFrom: w?.loopFrom,
-      onEvent: (name) => {
-        o.onEvent?.(name);
-        if (name === 'hit' && this.pendingHit) {
-          const fn = this.pendingHit.fn;
-          this.pendingHit = null;
-          fn();
-        }
-      },
+      onEvent: o.onEvent,
       onEnd: o.onEnd,
       carryRoot: o.carryRoot ? (dx, dz, dyaw) => this.carryRoot(dx, dz, dyaw) : undefined,
     });
@@ -297,16 +304,24 @@ export class Unit {
     return Math.hypot(this.locoX, this.locoZ);
   }
 
-  /** Per-frame visuals: hit-event fallback, LED flash, motion and rig update. */
-  updateVisual(dt: number): void {
-    if (this.pendingHit) {
-      this.pendingHit.left -= dt;
-      if (this.pendingHit.left <= 0) {
-        const fn = this.pendingHit.fn;
-        this.pendingHit = null;
-        fn();
-      }
+  /** Simulation step: a pending swing lands when its time comes, on screen or not. */
+  updateHit(dt: number): void {
+    if (!this.pendingHit) return;
+    this.pendingHit.left -= dt;
+    if (this.pendingHit.left <= 0) {
+      const fn = this.pendingHit.fn;
+      this.pendingHit = null;
+      fn();
     }
+  }
+
+  /** Seconds until the pending swing lands, or null. */
+  get pendingHitIn(): number | null {
+    return this.pendingHit ? this.pendingHit.left : null;
+  }
+
+  /** Per-frame visuals: LED flash, motion and rig update. */
+  updateVisual(dt: number): void {
     if (this.flashT > 0) {
       this.flashT -= dt;
       if (this.flashT <= 0) this.rig.face.setTint(this.baseTint);

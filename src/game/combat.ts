@@ -1,9 +1,8 @@
 // Damage, healing, absorbs, crits and deaths. Every hit in the game goes through here so combat
-// text, hit reactions, rage and aggro stay consistent.
-import * as THREE from 'three';
+// text, hit reactions, rage and aggro stay consistent. What players see and hear of it leaves as
+// events (src/game/events.ts); reactions belong to the controller of the unit involved.
 import type { Game } from './game';
 import type { Unit } from './unit';
-import { C } from './vfx/vfx';
 
 export type School = 'physical' | 'frost' | 'water' | 'holy' | 'rust';
 
@@ -16,7 +15,20 @@ export interface HitOptions {
   rage?: number;
 }
 
-const v = new THREE.Vector3();
+/** What a unit's controller (Player, Enemy, Boss) does when combat touches its unit. */
+export interface CombatController {
+  /** Hit for dmg by src, unless the hit killed it: enemies and bosses wake. */
+  onDamaged?(src: Unit | null, dmg: number): void;
+  /** A player's own reaction to a hit that landed: pushback, rage taken, the dance ends. */
+  onHurt?(dmg: number): void;
+  /** Rage earned by landing a hit (warriors). */
+  gainRage?(n: number): void;
+  /** The unit's absorb shield took a hit; `broken` when nothing is left of it. */
+  onWardHit?(broken: boolean): void;
+  onDeath?(killer: Unit | null): void;
+}
+
+const ctrlOf = (u: Unit | null): CombatController | null => (u?.ctrl as CombatController | null) ?? null;
 
 export const CRIT_CHANCE = 0.12;
 export const CRIT_MULT = 1.75;
@@ -41,12 +53,13 @@ export class Combat {
     if (src) src.lastCombat = now;
     dst.lastCombat = now;
     if (dst.invulnerable) {
-      g.hud.floats.spawn(dst, 'Evade', 'info');
+      g.events.emit({ type: 'blocked', unit: dst, reason: 'evade' });
       return 0;
     }
     let dmg = Math.max(1, Math.round(amount));
+    const ctrl = ctrlOf(dst);
     if (dst.kind === 'player' && g.god) {
-      g.player.onDamaged(dmg);
+      ctrl?.onHurt?.(dmg);
       return 0;
     }
     // Absorb shields soak first.
@@ -54,31 +67,18 @@ export class Combat {
       const soaked = Math.min(dst.absorb, dmg);
       dst.absorb -= soaked;
       dmg -= soaked;
-      g.player.onWardHit(dst, dst.absorb <= 0);
+      ctrl?.onWardHit?.(dst.absorb <= 0);
       if (dmg <= 0) {
-        g.hud.floats.spawn(dst, 'Absorbed', 'info');
+        g.events.emit({ type: 'blocked', unit: dst, reason: 'absorbed' });
         return 0;
       }
     }
     dst.hp = Math.max(0, dst.hp - dmg);
     g.multiplayer?.battle.onDamage(src, dst, dmg, o);
     const crit = !!o.crit;
-    if (dst.kind === 'player') {
-      g.hud.floats.spawn(dst, `-${dmg}`, 'taken');
-      dst.flash('#ff2a1a', 0.18);
-      g.hud.damageFlash(dmg / dst.maxHp);
-      g.player.onDamaged(dmg);
-    } else {
-      g.hud.floats.spawn(dst, crit ? `${dmg}!` : `${dmg}`, crit ? 'crit' : 'dmg');
-      dst.flash('#ffffff', 0.1);
-    }
-    if (src?.kind === 'player' && o.rage) g.player.gainRage(o.rage);
-    if (crit) {
-      g.follow.shake(dst.kind === 'boss' ? 0.18 : 0.12, 0.25);
-      g.audio.sfx('sfx-crit', { volume: 0.8 });
-    } else {
-      g.audio.sfx('sfx-hit', { volume: 0.55 });
-    }
+    g.events.emit({ type: 'damage', src, dst, amount: dmg, crit, school: o.school });
+    if (dst.kind === 'player') ctrl?.onHurt?.(dmg);
+    if (src?.kind === 'player' && o.rage) ctrlOf(src)?.gainRage?.(o.rage);
     if (dst.hp <= 0) {
       this.kill(dst, src);
       return dmg;
@@ -90,7 +90,6 @@ export class Combat {
       dst.express('hurt', 0.4);
     }
     // Wake the victim.
-    const ctrl = dst.ctrl as { onDamaged?: (src: Unit | null, dmg: number) => void } | null;
     ctrl?.onDamaged?.(src, dmg);
     return dmg;
   }
@@ -100,9 +99,8 @@ export class Combat {
     const before = dst.hp;
     dst.hp = Math.min(dst.maxHp, dst.hp + Math.round(amount));
     const healed = dst.hp - before;
-    if (amount > 0) this.game.hud.floats.spawn(dst, crit ? `+${Math.round(amount)}!` : `+${Math.round(amount)}`, 'heal');
+    this.game.events.emit({ type: 'heal', src, dst, amount, crit });
     if (src) src.lastCombat = Math.max(src.lastCombat, this.game.time - 4);
-    this.game.audio.sfx('sfx-heal', { volume: 0.6 });
     return healed;
   }
 
@@ -111,21 +109,9 @@ export class Combat {
     dst.alive = false;
     dst.hp = 0;
     dst.cancelPendingHit();
-    dst.motion.stop(undefined, 0.1);
-    // The power-down: the legs give way and the shell settles on the floor, where it stays.
-    dst.act('death', {
-      fade: 0.1,
-      onEvent: (name) => {
-        if (name !== 'settled' || dst.hidden || dst.culled) return;
-        g.vfx.smoke(v.set(dst.pos.x, dst.pos.y + 0.05, dst.pos.z), C.dust, 6, 0.7 * dst.radius, 0.4, 0.35 * dst.height, 0.7);
-      },
-    });
-    dst.express('dead', 999);
-    dst.rig.face.setTint(null);
-    dst.centre(v);
-    g.vfx.deathPoof(dst);
-    const ctrl = dst.ctrl as { onDeath?: (killer: Unit | null) => void } | null;
-    ctrl?.onDeath?.(src);
+    // The power-down clip, the smoke as the shell settles and the poof are the sink's.
+    g.events.emit({ type: 'death', unit: dst, killer: src });
+    ctrlOf(dst)?.onDeath?.(src);
     g.onUnitDied(dst, src);
     g.multiplayer?.battle.onDeath(dst);
   }

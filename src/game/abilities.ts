@@ -1,12 +1,13 @@
 // What each class ability does once it is paid for. Numbers are tuned so a first quest run takes
-// 8 to 12 minutes and Corrodius about 90 seconds (see docs/design.md "Quest chain").
+// 8 to 12 minutes and Corrodius about 90 seconds (see docs/design.md "Quest chain"). Effects and
+// sounds leave as 'ability' events (src/game/events.ts); the projectile flies in the simulation.
 import * as THREE from 'three';
 import type { AbilityDef } from '../data/classes';
 import type { Game } from './game';
 import type { Player } from './player';
 import type { Unit } from './unit';
 import { rollCrit, CRIT_MULT } from './combat';
-import { C, N } from './vfx/vfx';
+import { v3 } from './events';
 import { angleDiff, rand, yawTo } from './util';
 
 const TARGETED = new Set(['pincer-strike', 'shell-bash', 'sideways-charge', 'bubble-bolt', 'smite']);
@@ -47,6 +48,9 @@ function knockback(g: Game, t: Unit, fromX: number, fromZ: number, dist: number,
 export function executeAbility(g: Game, p: Player, ab: AbilityDef, target: Unit | null): void {
   const u = p.unit;
   const now = g.time;
+  const ev = g.events;
+  const fx = (stage: 'start' | 'hit', more: { target?: Unit | null; from?: THREE.Vector3; amount?: number; stun?: number; half?: number } = {}) =>
+    ev.emit({ type: 'ability', caster: u, ability: ab.id, stage, range: ab.range, ...more, from: more.from && v3(more.from) });
   switch (ab.id) {
     // ------------------------------------------------------------ Warrior
     case 'pincer-strike': {
@@ -57,8 +61,7 @@ export function executeAbility(g: Game, p: Player, ab: AbilityDef, target: Unit 
         onHit: () => {
           if (!t.alive) return;
           hit(g, p, t, 16, 21, 'physical', 0.05);
-          g.vfx.slash(u, t, C.gold, 1.25);
-          g.follow.shake(0.06, 0.15);
+          fx('hit', { target: t });
         },
       });
       break;
@@ -74,27 +77,20 @@ export function executeAbility(g: Game, p: Player, ab: AbilityDef, target: Unit 
           t.stunUntil = Math.max(t.stunUntil, g.time + stun);
           t.cancelPendingHit();
           g.multiplayer?.battle.condition(t);
-          g.vfx.impact(t.centre(v1), C.white, 1.3);
-          g.vfx.ring(t.pos, N.gold, 0.3, 2.4, 0.4, 0.75);
-          g.vfx.stunStars(t, stun);
-          g.follow.shake(0.14, 0.22);
-          g.hud.floats.spawn(t, 'Stunned', 'info');
+          fx('hit', { target: t, stun });
         },
       });
       break;
     }
     case 'sideways-charge': {
       p.startDash(target!);
-      g.audio.sfx('sfx-servo-whir', { volume: 0.7 });
-      g.hud.floats.spawn(u, '+15 Rage', 'info');
+      fx('start', { target });
       break;
     }
     case 'whirlpool': {
       p.spin();
       u.act('attack_swipe', { upper: true, speed: 1.4 });
-      g.vfx.whirlpool(u, ab.range);
-      g.audio.sfx('sfx-hit', { volume: 0.7 });
-      g.follow.shake(0.1, 0.3);
+      fx('start');
       for (const t of enemiesNear(g, u.pos.x, u.pos.z, ab.range)) {
         hit(g, p, t, 15, 20, 'water');
         knockback(g, t, u.pos.x, u.pos.z, 1.6);
@@ -106,7 +102,7 @@ export function executeAbility(g: Game, p: Player, ab: AbilityDef, target: Unit 
       const t = target!;
       const from = u.socketPos('clawR', v1).clone();
       u.act('attack_swipe', { upper: true, speed: 1.5 });
-      g.vfx.projectile(from, t, 'bubble', 17, () => {
+      g.projectiles.spawn(u, from, t, 'bubble', 17, () => {
         if (!t.alive) return;
         hit(g, p, t, 33, 39, 'water');
       });
@@ -115,8 +111,7 @@ export function executeAbility(g: Game, p: Player, ab: AbilityDef, target: Unit 
     case 'frost-spray': {
       const half = 0.55;
       u.act('attack_swipe', { upper: true, speed: 1.3 });
-      g.vfx.frostSpray(u.pos, u.yaw, ab.range, half);
-      g.audio.sfx('sfx-cast', { volume: 0.5 });
+      fx('start', { half });
       for (const t of enemiesNear(g, u.pos.x, u.pos.z, ab.range)) {
         const a = yawTo(u.pos.x, u.pos.z, t.pos.x, t.pos.z);
         if (Math.abs(angleDiff(a, u.yaw)) > half + Math.atan2(t.radius, Math.max(0.5, u.distTo(t)))) continue;
@@ -129,14 +124,13 @@ export function executeAbility(g: Game, p: Player, ab: AbilityDef, target: Unit 
     }
     case 'steam-blink': {
       const from = u.pos.clone();
-      g.vfx.steamPuff(from);
-      const fx = Math.sin(u.yaw);
-      const fz = Math.cos(u.yaw);
+      const dx = Math.sin(u.yaw);
+      const dz = Math.cos(u.yaw);
       let x = u.pos.x;
       let z = u.pos.z;
       for (let d = 0.5; d <= ab.range + 1e-6; d += 0.5) {
-        const tx = from.x + fx * d;
-        const tz = from.z + fz * d;
+        const tx = from.x + dx * d;
+        const tz = from.z + dz * d;
         const r = g.world.resolveCollision(tx, tz, u.radius, v2);
         if (Math.hypot(r.x - tx, r.y - tz) > 0.25) break;
         if (Math.abs(g.world.heightAt(tx, tz) - g.world.heightAt(x, z)) > 2.5) break;
@@ -144,15 +138,13 @@ export function executeAbility(g: Game, p: Player, ab: AbilityDef, target: Unit 
         z = r.y;
       }
       u.teleport(g.world, x, z);
-      g.vfx.steamPuff(u.pos);
-      g.audio.sfx('sfx-servo-whir', { volume: 0.6 });
+      // A puff where the crab left and one where it stands.
+      fx('start', { from });
       break;
     }
     case 'tidal-nova': {
       u.act('attack_slam', { upper: true });
-      g.vfx.tidalNova(u.pos, ab.range);
-      g.follow.shake(0.15, 0.3);
-      g.audio.sfx('sfx-crit', { volume: 0.5 });
+      fx('start');
       for (const t of enemiesNear(g, u.pos.x, u.pos.z, ab.range)) {
         hit(g, p, t, 20, 26, 'water');
         knockback(g, t, u.pos.x, u.pos.z, 5);
@@ -164,26 +156,24 @@ export function executeAbility(g: Game, p: Player, ab: AbilityDef, target: Unit 
     // ------------------------------------------------------------ Priest
     case 'smite': {
       const t = target!;
-      g.vfx.smite(t);
-      g.audio.sfx('sfx-cast', { volume: 0.4 });
+      fx('start', { target: t });
       const dmg = hit(g, p, t, 27, 33, 'holy');
-      if (dmg > 32) g.follow.shake(0.08, 0.15);
+      fx('hit', { target: t, amount: dmg });
       break;
     }
     case 'mend-shell': {
       const crit = rollCrit();
       g.combat.heal(u, u, u.maxHp * 0.35 * (crit ? 1.5 : 1), crit);
-      g.vfx.mendGlow(u);
+      fx('start');
       u.express('happy', 1);
       break;
     }
     case 'barnacle-ward': {
       u.absorbMax = u.absorb = Math.round(u.maxHp * 0.3);
       u.absorbUntil = now + 10;
-      p.ward?.pop();
-      p.ward = g.vfx.ward(u, 10);
-      g.audio.sfx('sfx-heal', { volume: 0.4 });
-      g.hud.floats.spawn(u, 'Barnacle Ward', 'info');
+      p.warded = true;
+      ev.emit({ type: 'ward', unit: u, stage: 'up', seconds: 10 });
+      fx('start');
       break;
     }
     case 'holy-tide': {
@@ -194,8 +184,7 @@ export function executeAbility(g: Game, p: Player, ab: AbilityDef, target: Unit 
         speed: 1.5,
         onHit: () => {
           if (!u.alive) return;
-          g.vfx.holyTide(u.pos, ab.range);
-          g.follow.shake(0.1, 0.25);
+          fx('hit');
           for (const t of enemiesNear(g, u.pos.x, u.pos.z, ab.range)) hit(g, p, t, 15, 19, 'holy');
           g.combat.heal(u, u, u.maxHp * 0.15);
         },

@@ -12,3 +12,9 @@ export function bossWarning(kind:'slam'|'spray'|'undertow'|'nova'|'eclipse'|'cro
     case 'eclipse': return t('검은 일식! 보스 곁의 초록 원 안으로 피하세요.','Black Eclipse! Enter the green circle beside the boss.');
   }
 }
+
+/** The banner a boss's phase change raises: its title, then what to do. */
+export function bossPhaseBanner(level:number,phase:2|3):[()=>string,()=>string] {
+  if(phase===2)return [() => (t('2단계','PHASE II')),() => (level === 100 ? t('황혼의 폭격 · 표시된 원과 길을 피하세요!','Twilight Barrage · Leave the marked circles and lanes!') : level === 20 ? t('검은 일식 · 초록 원 안쪽이 안전합니다!','Black Eclipse · Stay inside the green circle!') : level >= 10 ? t('심해 파동 · 푸른 원을 벗어나세요!','Tidal Nova · Leave the blue circle!') : t('녹의 하수인들이 깨어납니다!','The rustlings awaken!'))];
+  return [() => (t('3단계 · 폭주','PHASE III · ENRAGE')),() => (level === 100 ? t('황혼의 왕관이 폭주합니다!','The Twilight Crown is enraged!') : level === 20 ? t('별의 왕관이 폭주합니다!','The Star Crown is enraged!') : level >= 10 ? t('심해의 왕관이 폭주합니다!','The Deep Crown is enraged!') : t('갑옷이 새하얗게 달아오릅니다!','The armour burns white-hot!'))];
+}

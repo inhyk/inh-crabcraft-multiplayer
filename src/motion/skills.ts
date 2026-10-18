@@ -79,6 +79,16 @@ export function skillDelay(id: SkillId, event: string, w: SkillWindow = skillWin
   return Math.max(0, (t - w.from) / w.speed);
 }
 
+/**
+ * Seconds from the start of an action until a skill clip's 'hit' moment, for the window and rate
+ * Unit.act plays it at (the same arguments). Null for other clips and for windows the caller cut
+ * itself (`from`). Gameplay lands a blow at this time; the clip only shows it.
+ */
+export function actionHitDelay(id: MotionId, o: { speed?: number; part?: SkillPart; loop?: boolean; from?: number } = {}): number | null {
+  if (!isSkill(id) || o.from !== undefined) return null;
+  return skillDelay(id, 'hit', skillWindow(id, o.part ?? (o.loop ? 'channel' : 'move'), o.speed));
+}
+
 /** MotionPlayOptions for a skill clip: its window and rate, merged under the caller's options. */
 export function skillPlayOptions(id: MotionId, opts: MotionPlayOptions = {}, part: SkillPart = opts.loop ? 'channel' : 'move'): MotionPlayOptions {
   if (!isSkill(id)) return opts;

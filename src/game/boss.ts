@@ -1,19 +1,19 @@
 // Corrodius, the Rust Tyrant (docs/design.md "Boss fight"). Three phases, telegraphed Anchor Slam,
 // Rust Spray cone with a stacking slow, Scrapling adds and Undertow in phase 2, enrage in phase 3,
 // and the death sequence where a small red crab steps out of the armour and walks into the sea.
+// Warnings, impacts, yells and the boss frame leave as events (src/game/events.ts); the marks'
+// shapes are computed here, so the authority and its followers draw the same thing.
 import type { BossState } from '../../server/combatProtocol';
 import {t} from '../i18n';
-import {bossWarning} from './bossLocale';
 import * as THREE from 'three';
 import type { Poi } from '../world/types';
 import type { Game } from './game';
 import type { Unit } from './unit';
 import type { Enemy } from './enemies';
+import { v3, type ImpactShape, type TelegraphShape } from './events';
 import { skillDelay, skillWindow } from '../motion/skills';
 import { BOSS_YELLS } from './quests';
 import { BOSS_PROFILES, type BossProfile } from './progression';
-import { C } from './vfx/vfx';
-import type { Fx } from './vfx/effects';
 import { angleDiff, rand, turnToward, yawTo } from './util';
 
 export const BOSS_HP = 1300;
@@ -28,7 +28,6 @@ const SPRAY_LEAD = skillDelay('attack_swipe', 'hit') ?? 0.4;
 type Mech = NonNullable<BossState['mech']>['kind'];
 type State = 'dormant' | 'waking' | 'idle' | 'fight' | 'dying' | 'dead';
 
-const v1 = new THREE.Vector3();
 const g1 = new THREE.Vector3();
 const g2 = new THREE.Vector3();
 const g3 = new THREE.Vector3();
@@ -40,7 +39,6 @@ interface ActiveMech {
   dur: number;
   at: THREE.Vector3;
   yaw: number;
-  fx: Fx[];
   fired: boolean;
   swung: boolean;
 }
@@ -58,8 +56,8 @@ export class Boss {
   private freedStarted = false;
   private outside = 0;
   private get isDawn(){return this.profile.level===100;}
-  private participants(){return (this.game.combatPlayers?.()??[this.game.player.unit]).filter(p=>!this.isDawn||p.level>=this.profile.level);}
-  private target(){return this.isDawn?this.participants().filter(p=>p.alive).sort((a,b)=>this.unit.distTo(a)-this.unit.distTo(b))[0]??this.game.player.unit:this.game.combatTarget?.(this.unit)??this.game.player.unit;}
+  private participants(){return this.game.combatPlayers().filter(p=>!this.isDawn||p.level>=this.profile.level);}
+  private target(){return this.isDawn?this.participants().filter(p=>p.alive).sort((a,b)=>this.unit.distTo(a)-this.unit.distTo(b))[0]??this.game.combatTarget(this.unit):this.game.combatTarget(this.unit);}
   private radius(kind:Mech){return kind==='eclipse'?(this.isDawn?14:11):kind==='slam'?(this.isDawn?4.8:3.4):kind==='nova'?(this.isDawn?8:6):this.isDawn?6.5:5.5;}
   private crossAngles(yaw:number){return this.isDawn?[yaw,yaw+Math.PI/4,yaw+Math.PI/2,yaw+3*Math.PI/4]:[yaw,yaw+Math.PI/2];}
   private get laneLength(){return this.isDawn?15:12;}
@@ -97,7 +95,16 @@ export class Boss {
     return this.mech?.kind ?? null;
   }
 
-  private warning:HTMLElement|null=null;
+  /** Seconds in the current state (waking, dying): what the effects of those states follow. */
+  get stateTime(): number {
+    return this.stateT;
+  }
+
+  /** Seconds since the freed crab stepped out, or -1. */
+  get freedTime(): number {
+    return this.freedT;
+  }
+
   private remoteMechId = -1;
   networkState(id: BossState['id']): BossState {
     const m = this.mech;
@@ -109,7 +116,7 @@ export class Boss {
   }
   applyNetwork(s: BossState): void {
     const g=this.game;
-    if (s.phase > this.phase && s.state === 'fight') g.hud.messages.banner(() => (t(`${s.phase}단계`,`PHASE ${s.phase}`)),() => (this.profile.name),'boss');
+    if (s.phase > this.phase && s.state === 'fight') g.events.emit({type:'boss',boss:this.unit,stage:'phase',phase:s.phase,remote:true});
     this.state=s.state; this.phase=s.phase; this.enraged=s.enraged;
     const timeline=s.timeline;
     if(timeline&&Number.isFinite(timeline.state)&&Number.isFinite(timeline.freed)&&Number.isFinite(timeline.freedYaw)&&typeof timeline.released==='boolean'){
@@ -124,13 +131,12 @@ export class Boss {
     } else this.stateT=0; // Legacy checkpoints retain their previous restart behavior.
 
     this.unit.setBaseTint(this.enraged ? '#fff4d9' : this.profile.color);
-    if (this.state === 'fight') g.hud.bossFrame.show(this.unit);
-    else if (g.encounter === this) g.hud.bossFrame.hide();
+    g.events.emit({type:'boss',boss:this.unit,stage:'frame',show:this.state==='fight'});
     const m=s.mech;
     if (!m) {
       const old=this.mech;
       if (old && s.state === 'fight') {
-        this.impactVisual(old.kind,old.at,old.yaw);
+        g.events.emit({type:'impact',src:this.unit,mech:old.kind,shapes:this.impactShapes(old.kind,old.at,old.yaw),loud:false});
       }
       this.clearMech(); this.remoteMechId=-1; return;
     }
@@ -141,12 +147,12 @@ export class Boss {
       return;
     }
     this.clearMech(); this.remoteMechId=m.id;
-    const at=new THREE.Vector3(...m.at),fx:Fx[]=[];
+    const at=new THREE.Vector3(...m.at);
     const duration=Math.max(0.05,m.left);
-    fx.push(...this.mechTelegraphs(m.kind,at,m.yaw,duration));
-    this.mech={kind:m.kind,t:0,dur:duration,at,yaw:m.yaw,fx,fired:false,swung:false};
+    const shapes=this.telegraphShapes(m.kind,at,m.yaw);
+    this.mech={kind:m.kind,t:0,dur:duration,at,yaw:m.yaw,fired:false,swung:false};
     this.mechIndex=m.id;
-    this.warning=g.hud.messages.warn(bossWarning(m.kind,this.profile.level),{persistent:true});
+    g.events.emit({type:'telegraph',src:this.unit,mech:m.kind,level:this.profile.level,seconds:duration,shapes});
   }
   resumeAuthority(): void {
     // Preserve replicated attack and cinematic timelines; restart only local scheduling timers.
@@ -157,7 +163,7 @@ export class Boss {
 
   /** The beacon is lit: Corrodius heaves himself up on the deck. */
   wake(): void {
-    if(this.isDawn&&(this.game.partyLevel??this.game.player.level)<this.profile.level)return;
+    if(this.isDawn&&this.game.partyLevel<this.profile.level)return;
     if (this.game.multiplayer?.battle.challenge(this.profile.level === 100 ? 'b30' : this.profile.level === 20 ? 'b20' : this.profile.level === 10 ? 'b10' : 'b3')) return;
     if (this.state !== 'dormant') return;
     if(this.profile.level<20 && this.game.world.getEnvironment?.().beacon===false)return;
@@ -172,23 +178,26 @@ export class Boss {
   }
 
   onDamaged(src: Unit | null): void {
-    if (this.state === 'idle' && src && (this.game.partyLevel ?? this.game.player.level) >= this.profile.level) this.engage();
+    if (this.state === 'idle' && src && this.game.partyLevel >= this.profile.level) this.engage();
+  }
+
+  private yell(u: Unit, text: string): void {
+    this.game.events.emit({ type: 'say', unit: u, text, yell: true });
   }
 
   private engage(): void {
     const g = this.game;
     if(this.profile.level<20&&g.world.getEnvironment?.().beacon===false)return;
-    if ((g.partyLevel ?? g.player.level) < this.profile.level) return;
+    if (g.partyLevel < this.profile.level) return;
     this.state = 'fight';
     if(this.profile.level<20)g.world.setMood?.(1);
-    g.player.unit.blessingUntil = Infinity;
+    // Moonwater mends every fighter while the boss stands (consumed by the victory).
+    for (const p of g.combatPlayers()) p.blessingUntil = Infinity;
     this.nextSwing = g.time + 1.2;
     this.nextMech = g.time + 4;
     this.unit.express('angry', 3);
-    g.say(this.unit, this.profile.level === 100 ? t('너희의 새벽도, 친구도 내 것이다!','Your dawn and your friend belong to me!') : this.profile.level === 20 ? t('별의 문을 연 자여, 일식의 시험을 받아라!','You who opened the star gate, face the trial of the eclipse!') : this.profile.level >= 10 ? t('심해의 빛을 피할 수 있겠느냐!','Can you escape the light of the deep?') : BOSS_YELLS.engage, true);
-    g.audio.sfx('sfx-boss-roar');
-    g.hud.bossFrame.show(this.unit);
-    g.follow.shake(0.25, 0.6);
+    this.yell(this.unit, this.profile.level === 100 ? t('너희의 새벽도, 친구도 내 것이다!','Your dawn and your friend belong to me!') : this.profile.level === 20 ? t('별의 문을 연 자여, 일식의 시험을 받아라!','You who opened the star gate, face the trial of the eclipse!') : this.profile.level >= 10 ? t('심해의 빛을 피할 수 있겠느냐!','Can you escape the light of the deep?') : BOSS_YELLS.engage);
+    g.events.emit({ type: 'boss', boss: this.unit, stage: 'engage' });
   }
 
   sleep():void {
@@ -216,7 +225,7 @@ export class Boss {
     this.outside = 0;
     this.mechIndex = 0;
     u.cancelPendingHit();
-    g.hud.bossFrame.hide();
+    g.events.emit({ type: 'boss', boss: u, stage: 'reset' });
   }
 
   onDeath(): void {
@@ -225,11 +234,8 @@ export class Boss {
     this.stateT = 0;
     this.clearMech();
     for (const a of this.adds) if (a.unit.alive) g.combat.kill(a.unit, null);
-    g.say(this.unit, this.profile.level === 100 ? t('새벽의 빛을… 가둘 수는 없었구나.','The dawn… could never be imprisoned.') : this.profile.level === 20 ? t('일식이 걷히는구나… 두 세계를 부탁한다.','The eclipse fades… Take care of both worlds.') : this.profile.level >= 10 ? t('심해가 다시 잠잠해지는구나…','The deep grows quiet once more…') : BOSS_YELLS.death, true);
-    if (this.profile.level >= 10) g.vfx.tidalNova(this.unit.pos, 8);
-    else g.vfx.rustPeel(this.unit, 4.5);
-    g.follow.shake(0.35, 1.2);
-    g.audio.sfx('sfx-boss-roar', { volume: 0.7, pitch: 0 });
+    this.yell(this.unit, this.profile.level === 100 ? t('새벽의 빛을… 가둘 수는 없었구나.','The dawn… could never be imprisoned.') : this.profile.level === 20 ? t('일식이 걷히는구나… 두 세계를 부탁한다.','The eclipse fades… Take care of both worlds.') : this.profile.level >= 10 ? t('심해가 다시 잠잠해지는구나…','The deep grows quiet once more…') : BOSS_YELLS.death);
+    g.events.emit({ type: 'boss', boss: this.unit, stage: 'death' });
     this.unit.targetable = false;
   }
 
@@ -248,17 +254,17 @@ export class Boss {
         this.updateFreed(dt);
         return;
       case 'waking': {
+        // The deck's dust while he heaves himself up is drawn from stateTime (src/game/browserSink.ts).
         const k = Math.min(1, this.stateT / 2.4);
         u.lift = -u.height * (1 - k) * (1 - k);
         u.pos.y = g.world.heightAt(u.pos.x, u.pos.z) + u.lift;
-        if (this.stateT < 2.4 && Math.random() < 0.5) g.vfx.burrow(v1.set(u.pos.x + rand(-2, 2), u.pos.y - u.lift, u.pos.z + rand(-2, 2)));
         if (k >= 1) {
           u.lift = 0;
           this.state = 'idle';
           u.targetable = unlocked;
           u.act('attack_slam');
-          g.say(u, this.profile.level === 100 ? t('솔라칸이 황혼 성채에서 깨어났다.','Solarkan awakens in the Twilight Citadel.') : this.profile.level === 20 ? t('아스트라가 별의 왕좌에서 깨어났다.','Astra awakens upon the Star Throne.') : this.profile.level >= 10 ? t('네레이드가 심해에서 깨어났다.','Nereid awakens from the deep.') : BOSS_YELLS.wake, true);
-          g.audio.sfx('sfx-boss-roar');
+          this.yell(u, this.profile.level === 100 ? t('솔라칸이 황혼 성채에서 깨어났다.','Solarkan awakens in the Twilight Citadel.') : this.profile.level === 20 ? t('아스트라가 별의 왕좌에서 깨어났다.','Astra awakens upon the Star Throne.') : this.profile.level >= 10 ? t('네레이드가 심해에서 깨어났다.','Nereid awakens from the deep.') : BOSS_YELLS.wake);
+          g.events.emit({ type: 'boss', boss: u, stage: 'awake' });
         }
         u.feedLocomotion(dt);
         return;
@@ -282,19 +288,15 @@ export class Boss {
     const fromArena = Math.hypot(p.pos.x - this.arena.position.x, p.pos.z - this.arena.position.z);
     this.outside = fromArena > this.arena.radius + ARENA_LEASH ? this.outside + dt : 0;
     if (!p.alive || this.isDawn&&p.level<this.profile.level || this.outside > 4) {
-      if (p.alive) g.say(u, t('달아나라, 작은 껍질아. 녹은 기억한다.','Run, little shell. The rust remembers.'), true);
+      if (p.alive) this.yell(u, t('달아나라, 작은 껍질아. 녹은 기억한다.','Run, little shell. The rust remembers.'));
       this.reset();
       return;
     }
 
-    // Phase changes
+    // Phase changes (an enraged boss vents heat; the sink draws it from `enraged`)
     const frac = u.hp / u.maxHp;
     if (this.phase === 1 && frac < (this.isDawn?.75:.6)) this.enterPhase2();
     if (this.phase === 2 && frac < (this.isDawn?.4:.25)) this.enterPhase3();
-    if (this.enraged) {
-      g.vfx.heatVent(u);
-      if (Math.random() < 0.3) g.vfx.heatVent(u);
-    }
 
     const stunned = !this.isDawn&&u.stunned(now);
     if (this.mech) {
@@ -313,13 +315,11 @@ export class Boss {
         this.nextSwing = now + (this.isDawn?(this.enraged?1.3:1.8):(this.enraged ? 1.8 : 2.6));
         u.act('attack_swipe', {
           upper: true,
-          hitAt: 0.35,
           speed: this.enraged ? 1.4 : 1,
           onHit: () => {
             if (!u.alive || !p.alive || u.gapTo(p) > 2.4) return;
             g.combat.damage(u, p, rand(7, 10) * this.profile.damage * (this.enraged ? 1.25 : 1));
-            g.vfx.slash(u, p, C.ember, 1.3);
-            g.follow.shake(0.08, 0.15);
+            g.events.emit({ type: 'attack', src: u, attack: 'bossClaw', stage: 'hit', target: p });
           },
         });
       }
@@ -331,10 +331,8 @@ export class Boss {
   private enterPhase2(): void {
     const g = this.game;
     this.phase = 2;
-    g.say(this.unit, this.profile.level === 100 ? t('황혼의 불길 속으로 들어오라!','Step into the flames of twilight!') : this.profile.level === 20 ? t('별의 그림자 속으로 들어오라!','Step into the shadow of the stars!') : this.profile.level >= 10 ? t('깊은 바다의 힘이 깨어난다!','The power of the deep awakens!') : BOSS_YELLS.phase2, true);
-    g.audio.sfx('sfx-boss-roar');
-    g.follow.shake(0.3, 0.6);
-    g.hud.messages.banner(() => (t('2단계','PHASE II')),() => (this.profile.level === 100 ? t('황혼의 폭격 · 표시된 원과 길을 피하세요!','Twilight Barrage · Leave the marked circles and lanes!') : this.profile.level === 20 ? t('검은 일식 · 초록 원 안쪽이 안전합니다!','Black Eclipse · Stay inside the green circle!') : this.profile.level >= 10 ? t('심해 파동 · 푸른 원을 벗어나세요!','Tidal Nova · Leave the blue circle!') : t('녹의 하수인들이 깨어납니다!','The rustlings awaken!')), 'boss');
+    this.yell(this.unit, this.profile.level === 100 ? t('황혼의 불길 속으로 들어오라!','Step into the flames of twilight!') : this.profile.level === 20 ? t('별의 그림자 속으로 들어오라!','Step into the shadow of the stars!') : this.profile.level >= 10 ? t('깊은 바다의 힘이 깨어난다!','The power of the deep awakens!') : BOSS_YELLS.phase2);
+    g.events.emit({ type: 'boss', boss: this.unit, stage: 'phase', phase: 2 });
     const u = this.unit;
     for (let i = 0; i < (this.profile.level >= 10 ? 0 : 3); i++) {
       const a = u.yaw + Math.PI + (i - 1) * 0.9;
@@ -352,10 +350,8 @@ export class Boss {
     this.enraged = true;
     this.unit.setBaseTint('#fff1d6');
     this.unit.express('angry', 999);
-    g.say(this.unit, this.profile.level >= 10 ? t('왕관의 빛이여, 모든 것을 삼켜라!','Light of the crown, consume everything!') : BOSS_YELLS.phase3, true);
-    g.audio.sfx('sfx-boss-roar');
-    g.follow.shake(0.35, 0.8);
-    g.hud.messages.banner(() => (t('3단계 · 폭주','PHASE III · ENRAGE')),() => (this.profile.level === 100 ? t('황혼의 왕관이 폭주합니다!','The Twilight Crown is enraged!') : this.profile.level === 20 ? t('별의 왕관이 폭주합니다!','The Star Crown is enraged!') : this.profile.level >= 10 ? t('심해의 왕관이 폭주합니다!','The Deep Crown is enraged!') : t('갑옷이 새하얗게 달아오릅니다!','The armour burns white-hot!')), 'boss');
+    this.yell(this.unit, this.profile.level >= 10 ? t('왕관의 빛이여, 모든 것을 삼켜라!','Light of the crown, consume everything!') : BOSS_YELLS.phase3);
+    g.events.emit({ type: 'boss', boss: this.unit, stage: 'phase', phase: 3 });
     this.nextMech = g.time + 2.5;
   }
 
@@ -367,7 +363,7 @@ export class Boss {
       (this.phase === 1 ? ['slam', 'nova', 'spray', 'cross', 'barrage'] : ['nova', 'undertow', 'slam', 'cross', 'barrage', 'nova']) :
       this.phase === 1 ? ['slam', 'spray'] : this.phase === 2 ? ['undertow', 'slam', 'spray', 'cross', 'slam'] : ['slam', 'spray', 'undertow', 'cross', 'barrage'];
     const kind = order[this.mechIndex++ % order.length];
-    const m: ActiveMech = { kind, t: 0, dur: 1.5, at: new THREE.Vector3(), yaw: u.yaw, fx: [], fired: false, swung: false };
+    const m: ActiveMech = { kind, t: 0, dur: 1.5, at: new THREE.Vector3(), yaw: u.yaw, fired: false, swung: false };
     const speedUp = (this.enraged ? 0.8 : 1) * this.profile.tempo;
     if (kind === 'slam') { m.dur=1.5*speedUp; m.at.copy(p.pos); }
     else if (kind === 'spray') {
@@ -385,15 +381,15 @@ export class Boss {
       m.dur=Math.max(2.6,3*speedUp); m.at.copy(p.pos);
       m.yaw=yawTo(u.pos.x,u.pos.z,p.pos.x,p.pos.z);
     } else {
-      m.dur=2.6; m.at.copy(u.pos); g.say(u,BOSS_YELLS.undertow,true);
+      m.dur=2.6; m.at.copy(u.pos); this.yell(u,BOSS_YELLS.undertow);
     }
     if(this.isDawn){
       // Larger warnings retain time to walk out; difficulty comes from pressure and mistakes.
       m.dur=Math.max(m.dur,kind==='nova'?2.4:kind==='eclipse'?2.8:kind==='undertow'?3:kind==='slam'?1.6:1.3);
     }
-    m.fx.push(...this.mechTelegraphs(kind,m.at,m.yaw,m.dur));
-    this.warning=g.hud.messages.warn(bossWarning(kind,this.profile.level),{persistent:true});
+    const shapes = this.telegraphShapes(kind,m.at,m.yaw);
     this.mech = m;
+    g.events.emit({ type: 'telegraph', src: u, mech: kind, level: this.profile.level, seconds: m.dur, shapes });
     this.nextMech = g.time + m.dur + (this.isDawn?(this.phase===3?.9:this.phase===2?1.2:1.8):(this.phase === 3 ? 4.2 : this.phase === 2 ? 5.5 : 6));
   }
 
@@ -402,18 +398,21 @@ export class Boss {
     return [-6,0,6].map(offset => new THREE.Vector3(at.x+Math.cos(yaw)*offset,at.y,at.z-Math.sin(yaw)*offset));
   }
 
-  /** One layout for host and followers; shape dimensions also match damage tests below. */
-  private mechTelegraphs(kind: Mech, at: THREE.Vector3, yaw: number, duration: number): Fx[] {
-    const vfx=this.game.vfx;
-    if (kind==='cross') return this.crossAngles(yaw).map(a=>vfx.telegraphLane(at,a,this.laneLength,this.laneWidth,duration,new THREE.Color('#ffb64d')));
-    if (kind==='barrage') return this.barragePoints(at,yaw).map(p=>vfx.telegraphCircle(p,this.barrageRadius,duration,new THREE.Color('#cf8aff'),this.deckUnder(p,this.barrageRadius,0,Math.PI)));
-    if (kind==='spray') return [vfx.telegraphCone(at,yaw,11,.55,duration,undefined,this.deckUnder(at,11,yaw,.55))];
+  /**
+   * One layout for host and followers; shape dimensions also match damage tests below. Each mark
+   * is laid on the deck under it, which moves `at` onto the deck (the circle's centre height).
+   */
+  private telegraphShapes(kind: Mech, at: THREE.Vector3, yaw: number): TelegraphShape[] {
+    if (kind==='cross') return this.crossAngles(yaw).map(a=>({shape:'lane',at:v3(at),yaw:a,halfLength:this.laneLength,halfWidth:this.laneWidth,color:'#ffb64d'}));
+    if (kind==='barrage') return this.barragePoints(at,yaw).map(p=>{const ground=v3(this.deckUnder(p,this.barrageRadius,0,Math.PI));return {shape:'circle',at:v3(p),radius:this.barrageRadius,color:'#cf8aff',ground};});
+    if (kind==='spray') {const ground=v3(this.deckUnder(at,11,yaw,.55));return [{shape:'cone',at:v3(at),yaw,range:11,half:.55,ground}];}
     const radius=this.radius(kind);
-    const color=kind==='eclipse'?new THREE.Color('#a050ff'):kind==='nova'?new THREE.Color(this.profile.color):undefined;
-    const fx=[vfx.telegraphCircle(at,radius,duration,color,this.deckUnder(at,radius,0,Math.PI))];
-    if(kind==='eclipse')fx.push(vfx.telegraphCircle(at,this.innerRadius,duration,new THREE.Color('#71ffca'),this.deckUnder(at,this.innerRadius,0,Math.PI)));
-    if(kind==='undertow')vfx.undertow(at,this.radius(kind),duration);
-    return fx;
+    const color=kind==='eclipse'?'#a050ff':kind==='nova'?this.profile.color:undefined;
+    const ground=v3(this.deckUnder(at,radius,0,Math.PI));
+    const shapes:TelegraphShape[]=[{shape:'circle',at:v3(at),radius,color,ground}];
+    if(kind==='eclipse'){const inner=v3(this.deckUnder(at,this.innerRadius,0,Math.PI));shapes.push({shape:'circle',at:v3(at),radius:this.innerRadius,color:'#71ffca',ground:inner});}
+    if(kind==='undertow')shapes.push({shape:'undertow',at:v3(at),radius:this.radius(kind)});
+    return shapes;
   }
 
   /**
@@ -464,9 +463,7 @@ export class Boss {
       }
       if (m.t >= m.dur) {
         m.fired = true;
-        this.impactVisual('slam',m.at);
-        g.follow.shake(0.5, 0.5);
-        g.audio.sfx('sfx-crit');
+        this.impact('slam',m.at);
         for (const p of this.participants()) if (p.alive && Math.hypot(p.pos.x - m.at.x, p.pos.z - m.at.z) < this.radius('slam') + p.radius * 0.5) {
           g.combat.damage(u, p, p.maxHp * this.fraction('slam'));
           p.stunUntil = Math.max(p.stunUntil, g.time + 0.5);
@@ -477,7 +474,7 @@ export class Boss {
       if (!m.swung && m.t > m.dur - SPRAY_LEAD) {
         m.swung = true;
         u.act('attack_swipe', { upper: true });
-        this.impactVisual('spray',m.at,m.yaw);
+        g.events.emit({ type: 'impact', src: u, mech: 'spray', shapes: this.impactShapes('spray', m.at, m.yaw), loud: false });
       }
       if (m.t >= m.dur) {
         m.fired = true;
@@ -488,7 +485,7 @@ export class Boss {
           g.combat.damage(u, p, rand(6, 9) * this.profile.damage);
           p.rust = Math.min(5, (g.time < p.rustUntil ? p.rust : 0) + 1);
           p.rustUntil = g.time + 10;
-          g.hud.floats.spawn(p, t(`녹 ${p.rust}중첩`,`Rust x${p.rust}`), 'info');
+          g.events.emit({ type: 'buff', unit: p, buff: 'rust', stacks: p.rust });
         }
         }
         this.finishMech();
@@ -496,8 +493,7 @@ export class Boss {
     } else if (m.kind === 'eclipse') {
       if (!m.swung && m.t > m.dur - SLAM_LEAD) { m.swung=true; u.act('attack_slam', {speed:SLAM_RATE}); }
       if (m.t >= m.dur) {
-        m.fired=true; this.impactVisual('eclipse',m.at);
-        g.follow.shake(0.5,0.7); g.audio.sfx('sfx-crit');
+        m.fired=true; this.impact('eclipse',m.at);
         for (const p of this.participants()) {
           const d=Math.hypot(p.pos.x-m.at.x,p.pos.z-m.at.z);
           if(p.alive && d>this.innerRadius && d<this.radius('eclipse')+p.radius*0.5) g.combat.damage(u,p,p.maxHp*this.fraction('eclipse'));
@@ -508,16 +504,14 @@ export class Boss {
       if (!m.swung && m.t > m.dur - SLAM_LEAD) { m.swung = true; u.act('attack_slam', { speed: SLAM_RATE }); }
       if (m.t >= m.dur) {
         m.fired = true;
-        this.impactVisual('nova',m.at);
-        g.follow.shake(0.4, 0.5);
-        g.audio.sfx('sfx-crit');
+        this.impact('nova',m.at);
         for (const p of this.participants()) if (p.alive && Math.hypot(p.pos.x - m.at.x, p.pos.z - m.at.z) < this.radius('nova') + p.radius * 0.5) g.combat.damage(u, p, p.maxHp * this.fraction('nova'));
         this.finishMech();
       }
     } else if (m.kind==='cross' || m.kind==='barrage') {
       if (!m.swung && m.t>m.dur-SLAM_LEAD) { m.swung=true; u.act('attack_slam',{speed:SLAM_RATE}); }
       if (m.t>=m.dur) {
-        m.fired=true; this.impactVisual(m.kind,m.at,m.yaw);g.follow.shake(.3,.4);g.audio.sfx('sfx-crit');
+        m.fired=true; this.impact(m.kind,m.at,m.yaw);
         const points=m.kind==='barrage'?this.barragePoints(m.at,m.yaw):[];
         for(const p of this.participants()) {
           if(!p.alive)continue;
@@ -546,63 +540,59 @@ export class Boss {
       }
       if (m.t >= m.dur) {
         m.fired = true;
-        this.impactVisual('undertow',m.at);
-        g.follow.shake(0.55, 0.6);
-        g.audio.sfx('sfx-crit');
+        this.impact('undertow',m.at);
         for (const p of this.participants()) if (p.alive && u.distTo(p) < this.radius('undertow') + p.radius * 0.5) g.combat.damage(u, p, p.maxHp * this.fraction('undertow'));
         this.finishMech();
       }
     }
   }
 
-  private impactVisual(kind:Mech,at:THREE.Vector3,yaw=0):void {
-    const vfx=this.game.vfx;
-    if(kind==='cross'){for(const a of this.crossAngles(yaw))vfx.telegraphLane(at,a,this.laneLength,this.laneWidth,.4,new THREE.Color('#ffd390'));return;}
-    if(kind==='barrage'){for(const p of this.barragePoints(at,yaw)){p.y=this.game.world.heightAt(p.x,p.z);vfx.slamImpact(p,this.barrageRadius);}return;}
-    if(kind==='spray'){vfx.rustSpray(at,yaw,11,.55);return;}
-    if(kind==='eclipse'){vfx.ring(at,new THREE.Color('#b577ff'),this.radius(kind),this.innerRadius,.8,.9);return;}
+  /** The authority's own impact: its effects with the shake and the crash. */
+  private impact(kind:Mech,at:THREE.Vector3,yaw=0):void {
+    this.game.events.emit({ type: 'impact', src: this.unit, mech: kind, shapes: this.impactShapes(kind, at, yaw), loud: true });
+  }
+
+  /** What a mechanic going off looks like: the same for the authority and its followers. */
+  private impactShapes(kind:Mech,at:THREE.Vector3,yaw=0):ImpactShape[] {
+    if(kind==='cross')return this.crossAngles(yaw).map(a=>({fx:'lane',at:v3(at),yaw:a,halfLength:this.laneLength,halfWidth:this.laneWidth,seconds:.4,color:'#ffd390'}));
+    if(kind==='barrage')return this.barragePoints(at,yaw).map(p=>({fx:'slam',at:{x:p.x,y:this.game.world.heightAt(p.x,p.z),z:p.z},radius:this.barrageRadius}));
+    if(kind==='spray')return [{fx:'spray',at:v3(at),yaw,range:11,half:.55}];
+    if(kind==='eclipse')return [{fx:'ring',at:v3(at),color:'#b577ff',r0:this.radius(kind),r1:this.innerRadius,seconds:.8,inner:.9}];
+    const shapes:ImpactShape[]=[];
     if(kind==='nova'){
-      const color=new THREE.Color(this.profile.color);
-      vfx.ring(at,color,.5,this.radius(kind)+1,.6,.85);vfx.ring(at,color,1,this.radius(kind),.8,.7);
+      const color=this.profile.color;
+      shapes.push({fx:'ring',at:v3(at),color,r0:.5,r1:this.radius(kind)+1,seconds:.6,inner:.85},{fx:'ring',at:v3(at),color,r0:1,r1:this.radius(kind),seconds:.8,inner:.7});
     }
-    vfx.slamImpact(at,this.radius(kind));
+    shapes.push({fx:'slam',at:v3(at),radius:this.radius(kind)});
+    return shapes;
   }
 
   refreshLanguage():void {
     this.unit.name=this.profile.name;this.unit.title=this.profile.title;
-    this.refreshWarning();
   }
 
-  refreshWarning():void {
-    if(this.mech)this.warning=this.game.hud.messages.warn(bossWarning(this.mech.kind,this.profile.level),{persistent:true});
-  }
-
-  private clearMechWarning():void {
-    if(this.warning)this.game.hud.messages.clearWarning(this.warning);
-    this.warning=null;
-  }
-
+  /** The mechanic fired: its warning comes down, its marks fade out on their own. */
   private finishMech():void {
-    this.clearMechWarning();this.mech=null;
+    this.mech=null;
+    this.game.events.emit({ type: 'telegraphEnd', src: this.unit, cancelled: false });
   }
 
+  /** The mechanic is called off (reset, death, a follower's newer checkpoint): marks and warning go. */
   private clearMech(): void {
-    this.clearMechWarning();
-    if (!this.mech) return;
-    for (const f of this.mech.fx) this.game.vfx.fx.release(f);
     this.mech = null;
+    this.game.events.emit({ type: 'telegraphEnd', src: this.unit, cancelled: true });
   }
 
   /** Debug F9: drop to the next phase threshold, then to zero. */
-  debugAdvance(): void {
+  debugAdvance(src: Unit): void {
     const g = this.game;
     const u = this.unit;
     if (this.state === 'idle') this.engage();
     if (this.state !== 'fight') return;
     const target = this.phase === 1 ? 0.58 : this.phase === 2 ? 0.23 : 0;
     const dmg = u.hp - u.maxHp * target;
-    if (target === 0) g.combat.damage(g.player.unit, u, u.hp + 10, { crit: true });
-    else if (dmg > 0) g.combat.damage(g.player.unit, u, dmg, { crit: true });
+    if (target === 0) g.combat.damage(src, u, u.hp + 10, { crit: true });
+    else if (dmg > 0) g.combat.damage(src, u, dmg, { crit: true });
   }
 
   // ---------------------------------------------------------------- death sequence
@@ -639,15 +629,13 @@ export class Boss {
     f.hidden = false;
     f.rig.root.visible = true;
     f.alive = true;
-    const p = g.combatTarget?.(u) ?? g.player.unit;
+    const p = g.combatTarget(u);
     const toward = yawTo(u.pos.x, u.pos.z, p.pos.x, p.pos.z);
     f.teleport(g.world, u.pos.x, u.pos.z, toward);
     f.rig.root.scale.setScalar(this.freedBaseScale * 0.3);
     this.freedT = 0;
     this.freedYaw = toward;
-    g.vfx.steamPuff(f.pos);
-    g.vfx.lootSparkle(f.pos);
-    g.audio.sfx('sfx-servo-whir');
+    g.events.emit({ type: 'freed', unit: f });
   }
 
   private freedBaseScale = 0;
@@ -657,7 +645,7 @@ export class Boss {
     const g = this.game;
     const f = this.freed;
     const u = this.unit;
-    const p = g.combatTarget?.(u) ?? g.player.unit;
+    const p = g.combatTarget(u);
     this.freedT += dt;
     const freedTime = this.freedT;
     // 0..1.2 grow and step out of the hull
@@ -674,16 +662,15 @@ export class Boss {
         f.npcId = 'bowed';
         f.act('gesture_bow');
         f.express('love', 3);
-        g.say(f, t('고마워. 그 안은 정말 어두웠어.','Thank you. It was very dark in there.'));
+        g.events.emit({ type: 'say', unit: f, text: t('고마워. 그 안은 정말 어두웠어.','Thank you. It was very dark in there.'), yell: false });
       }
     } else if (freedTime < 12) {
-      // Scuttle sideways into the sea.
+      // Scuttle sideways into the sea (the sink draws the foam from freedTime).
       const sea = g.seaDirection();
       const yaw = Math.atan2(sea.x, sea.z) + Math.PI / 2;
       f.setYaw(turnToward(f.yaw, yaw, 4, dt));
       f.moveTo(g.world, f.pos.x + sea.x * 3.4 * dt, f.pos.z + sea.z * 3.4 * dt, dt);
       if (freedTime > 10.5) f.lift = -(freedTime - 10.5) * 0.8;
-      if (Math.random() < 0.3) g.vfx.smoke(f.pos, C.foam, 1, 0.5, 0.6, 0.3, 0.6);
     } else {
       f.hidden = true;
       f.alive = false;

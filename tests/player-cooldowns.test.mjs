@@ -13,10 +13,9 @@ function setup(cls,ab){
  const target={...unit,pos:new THREE.Vector3(0,0,ab.id==='sideways-charge'?5:2),hostile:true,kind:'enemy',cancelPendingHit(){}};
  const effects=[],errors=[];
  const game={time:100,controlsLocked:false,world:{raycastSolid(){return null;},heightAt(){return 0;},resolveCollision(x,z,_radius,out){return out.set(x,z);}},
-  units:[target],input:{isDown(){return false;}},audio:{sfx(){}},follow:{shake(){}},
-  hud:{actionBar:{press(){}},castBar:{start(){},finish(){},fail(){}},messages:{error(m){errors.push(m);}},floats:{spawn(){}}},
+  units:[target],input:{isDown(){return false;}},
   combat:{damage(_a,_b,n){effects.push('damage');return n;},heal(){effects.push('heal');}},
-  vfx:new Proxy({projectile(_from,_to,_style,_speed,hit){hit();}},{get(o,k){return o[k]??(()=>({pop(){}}));}})};
+  events:{emit(e){if(e.type==='error')errors.push(e.reason);}},projectiles:{spawn(_src,_from,_to,_style,_speed,hit){hit();}}};
  const player=new Player(game,unit,cls);game.player=player;player.target=target;player.resource=player.maxResource=10000;player.nextSwing=Infinity;
  return {game,player,effects,errors};
 }

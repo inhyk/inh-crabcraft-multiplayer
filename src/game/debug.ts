@@ -8,6 +8,7 @@ import { C } from './vfx/vfx';
 import { xpForLevel } from './progression';
 import { h } from '../ui/dom';
 import { t } from '../i18n';
+import { capture } from '../capture/clock';
 
 function routineState(r: BreakRoutine) {
   const p = r.progress;
@@ -37,6 +38,16 @@ export class DebugTools {
       C,
       THREE,
     };
+    if (import.meta.env.DEV && this.enabled) {
+      const w = window as unknown as { render_game_to_text?: () => string; advanceTime?: (ms: number) => Promise<void> };
+      w.render_game_to_text = () => JSON.stringify({
+        ...this.state(),
+        coordinates: 'x right, y up, z south, metres',
+        player: { x: game.player.unit.pos.x, y: game.player.unit.pos.y, z: game.player.unit.pos.z, yaw: game.player.unit.yaw },
+      });
+      const clock = capture;
+      if (clock) w.advanceTime = async (ms) => { await clock.begin(); await clock.step(Math.max(1, Math.round(ms / (1000 / 60)))); };
+    }
   }
 
   refreshLanguage(): void {
@@ -102,12 +113,12 @@ export class DebugTools {
         break;
       case 'eclipse-boss':
         if(g.multiplayer?.battle.authority===false){g.hud.messages.info(t('보스 테스트는 방장이 진행해요.','Only the host can advance boss tests.'));return;}
-        if(g.worldBoss.state==='dormant')g.worldBoss.wake();else g.worldBoss.debugAdvance();
+        if(g.worldBoss.state==='dormant')g.worldBoss.wake();else g.worldBoss.debugAdvance(g.player.unit);
         break;
       case 'boss':
         if(g.multiplayer?.battle.authority===false){g.hud.messages.info(t('보스 테스트는 방장이 진행해요.','Only the host can advance boss tests.'));return;}
         if (g.boss.state === 'dormant') g.boss.wake();
-        else g.boss.debugAdvance();
+        else g.boss.debugAdvance(g.player.unit);
         break;
       default:g.quests.completeObjective(o);g.journey?.save();break;
     }
@@ -213,5 +224,10 @@ export class DebugTools {
     window.removeEventListener('keydown', this.onKey, true);
     this.panel.remove();
     delete (window as unknown as { cc?: unknown }).cc;
+    if (import.meta.env.DEV && this.enabled) {
+      const w = window as unknown as { render_game_to_text?: unknown; advanceTime?: unknown };
+      delete w.render_game_to_text;
+      if (capture) delete w.advanceTime;
+    }
   }
 }

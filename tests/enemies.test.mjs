@@ -6,7 +6,7 @@ import {Enemy,ENEMY_STATS} from '../tmp/test-modules/enemies.js';
 function make(kind='scrapling'){
  const unit={pos:new THREE.Vector3(),level:1,hp:1,maxHp:1,alive:true,hidden:false,invulnerable:false,baseTint:null,
   rig:{root:{visible:true}},motion:{stop(){}},express(){},cancelPendingHit(){},teleport(_world,x,z){this.pos.set(x,3,z)},setBaseTint(color){this.baseTint=color}};
- const game={time:10,partyLevel:20,world2:{chapter:2},journey:{rustCleared:false},world:{heightAt:()=>3},vfx:{burrow(){}}};
+ const game={time:10,partyLevel:20,world2:{chapter:2},journey:{rustCleared:false},world:{heightAt:()=>3},events:{emit(){}}};
  return {game,unit,enemy:new Enemy(game,unit,kind,new THREE.Vector3(),4)};
 }
 
@@ -42,9 +42,9 @@ test('guest chapter appearance refresh does not resurrect or heal a mirrored dea
 function jellyFight(){
  const s=make('jellyfish'),{game,unit,enemy}=s;game.world2.chapter=1;game.controlsLocked=false;enemy.state='chase';unit.radius=.7;unit.height=2;unit.pos.set(0,-.5,0);unit.pushTime=0;unit.lift=0;
  const target={kind:'player',alive:true,pos:new THREE.Vector3(0,-.5,3)};
- unit.stunned=()=>false;unit.gapTo=()=>2;unit.distTo=p=>unit.pos.distanceTo(p.pos);unit.speedMul=()=>1;unit.feedLocomotion=()=>{};unit.setYaw=()=>{};unit.moveTo=(_w,x,z)=>unit.pos.set(x,-.5,z);unit.act=(_id,opts)=>{s.hit=opts.onHit;};
- Object.assign(game,{combatTarget:()=>target,player:{unit:target,lineOfSight:()=>true},combat:{damage(){s.hits++;}},vfx:{ring(){s.warnings++;},sparks(){}},hud:{floats:{spawn(){}}}});
- game.world.heightAt=()=>-.5;game.world.resolveCollision=(x,z,_r,out)=>out.set(x,z);s.hits=0;s.warnings=0;s.target=target;return s;
+ unit.stunned=()=>false;unit.centre=out=>out.copy(unit.pos);unit.gapTo=()=>2;unit.distTo=p=>unit.pos.distanceTo(p.pos);unit.speedMul=()=>1;unit.feedLocomotion=()=>{};unit.setYaw=()=>{};unit.moveTo=(_w,x,z)=>unit.pos.set(x,-.5,z);unit.act=(_id,opts)=>{s.hit=opts.onHit;};
+ Object.assign(game,{combatTarget:()=>target,combatPlayers:()=>[target],combat:{damage(){s.hits++;}},events:{emit(e){if(e.type==='attack'&&e.attack==='seaCast'&&e.stage==='start')s.warnings++;}}});
+ game.world.heightAt=()=>-.5;game.world.raycastSolid=()=>null;game.world.resolveCollision=(x,z,_r,out)=>out.set(x,z);s.hits=0;s.warnings=0;s.target=target;return s;
 }
 test('sea drone warns before electricity, respects its recovery and can be dodged',()=>{
  const s=jellyFight();s.enemy.update(.016);assert.equal(s.warnings,1);assert.equal(s.hits,0);assert.equal(typeof s.hit,'function');

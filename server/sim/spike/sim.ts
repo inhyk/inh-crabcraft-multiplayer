@@ -1,17 +1,20 @@
 // Feasibility spike (docs/server-world.md): one World I area simulated headless in Node with the
 // game's own classes. Player (movement, GCD, cooldowns, casts, auto-attack, resources, XP),
 // abilities.ts, Combat, Enemy (wander, aggro, packs, chase, leap, leash, respawn), Boss (Corrodius'
-// phases and mechanics) and Unit (status effects, hit timing) are the shipped code, bundled as is.
-// Only what they reach for in the browser is replaced: the rig and motion controller by stubs, the
-// HUD, audio, camera shake and effects by no-ops, input by scripted bots, and the single local
-// player by one Game view per simulated player (see SimGame.viewFor).
+// phases and mechanics), Unit (status effects, hit timing) and the projectiles are the shipped code,
+// bundled as is. Since S1 they reach the outside only through their event sink (src/game/events.ts),
+// so the HUD, audio, camera and effects here are traps that record any touch (tests/sim-*.test.mjs
+// require none). The rig and motion controller are stubs and input comes from scripted bots; each
+// simulated player has a Game view of its own only for its keyboard and camera (see setup).
 import * as THREE from 'three';
 import { CLASSES } from '../../../src/data/classes';
 import type { ClassId, CrabRig, CrabSpec, RaceId } from '../../../src/crab/types';
 import { Boss } from '../../../src/game/boss';
-import { Combat, type HitOptions } from '../../../src/game/combat';
+import { Combat } from '../../../src/game/combat';
 import { Enemy, ENEMY_STATS, type EnemyKind } from '../../../src/game/enemies';
+import { SimEvents, SimTimers, type SimEvent } from '../../../src/game/events';
 import { Player } from '../../../src/game/player';
+import { Projectiles } from '../../../src/game/projectiles';
 import { BOSS_PROFILES, xpForLevel } from '../../../src/game/progression';
 import { QuestLog } from '../../../src/game/quests';
 import { Unit, type Reaction, type UnitKind } from '../../../src/game/unit';
@@ -21,23 +24,32 @@ import type { Poi, World } from '../../../src/world/types';
 
 // ------------------------------------------------------------------ browser stand-ins
 
-/** Absorbs any property read or call: the HUD, audio, camera shake and effects on a server. */
-const NOOP: any = new Proxy(() => {}, {
-  get(_t, k) {
-    if (k === 'then') return undefined;
-    if (k === Symbol.toPrimitive) return () => 0;
-    return NOOP;
-  },
-  apply() {
-    return NOOP;
-  },
-});
-/** An object whose own fields are real and everything else is NOOP. */
-const partial = <T extends object>(own: T): T & Record<string, any> =>
-  new Proxy(own, { get: (t, k) => (k in t ? (t as any)[k] : NOOP) }) as T & Record<string, any>;
+/**
+ * Stands in for a browser object the simulation must not use (HUD, effects, audio, camera, "the"
+ * local player): absorbs any read or call, and writes its path into `touched`.
+ */
+export function trap(name: string, touched: string[]): any {
+  const make = (path: string): any =>
+    new Proxy(() => {}, {
+      get(_t, k) {
+        if (k === 'then' || typeof k === 'symbol') return undefined;
+        touched.push(`${path}.${String(k)}`);
+        return make(`${path}.${String(k)}`);
+      },
+      apply() {
+        touched.push(`${path}()`);
+        return make(`${path}()`);
+      },
+      set(_t, k) {
+        touched.push(`${path}.${String(k)}=`);
+        return true;
+      },
+    });
+  return make(name);
+}
 
 /** A rig with no meshes: a root to hold position and yaw, one socket, a face that ignores everything. */
-function stubRig(spec: CrabSpec): CrabRig {
+export function stubRig(spec: CrabSpec): CrabRig {
   const root = new THREE.Group();
   const socket = new THREE.Object3D();
   socket.position.set(0, 0.8, 0.3);
@@ -58,17 +70,19 @@ function stubRig(spec: CrabSpec): CrabRig {
 }
 
 /**
- * Plays nothing and sends no clip events, so every swing lands on Unit.act's fallback timer
- * (the clip's own hit moment plus 0.1 s, src/motion/skills.ts): deterministic and data-only.
+ * Plays nothing and sends no clip events; swings land on the game clock at the clip's hit moment
+ * from the skill data (Unit.updateHit), as in the browser. `played` keeps the last play() call.
  */
-function stubMotion(): MotionController {
+export function stubMotion(): MotionController & { played: { id: MotionId; opts: MotionPlayOptions } | null } {
   let action: MotionId | null = null;
   let left = 0;
   return {
+    played: null,
     setLocomotion() {},
     play(id: MotionId, o?: MotionPlayOptions) {
       action = id;
       left = o?.loop ? Infinity : 0.8;
+      this.played = { id, opts: o ?? {} };
     },
     stop() {
       action = null;
@@ -83,7 +97,7 @@ function stubMotion(): MotionController {
   };
 }
 
-class ScriptedInput {
+export class ScriptedInput {
   readonly down = new Set<string>();
   mouseX = 0;
   mouseY = 0;
@@ -100,16 +114,6 @@ class ScriptedInput {
   wasClicked() {
     return false;
   }
-}
-
-interface Projectile {
-  x: number;
-  y: number;
-  z: number;
-  target: Unit;
-  speed: number;
-  t: number;
-  onHit: () => void;
 }
 
 // ------------------------------------------------------------------ the simulated area
@@ -134,15 +138,13 @@ export interface SimStats {
 const CLASS_ORDER: ClassId[] = ['warrior', 'mage', 'priest'];
 const RACE_ORDER: RaceId[] = ['human', 'orc', 'dwarf', 'undead', 'nightelf', 'tauren'];
 const v2 = new THREE.Vector2();
-const tv1 = new THREE.Vector3();
-const tv2 = new THREE.Vector3();
 
 export class SimClient {
   readonly input = new ScriptedInput();
-  readonly follow = partial({ steering: true, forwardYaw: 0, yaw: 0 });
+  /** The player's camera as its input reads it: steer toward forwardYaw. */
+  readonly follow = { steering: true, forwardYaw: 0, yaw: 0 };
   readonly quests = new QuestLog();
   player!: Player;
-  combat!: Combat;
   deadUntil = -1;
   nextThink = 0;
   slot = 0;
@@ -166,74 +168,47 @@ export class SimGame {
   readonly journey = { rustCleared: false, onKill() {}, onBossDefeated() {} };
   readonly controlsLocked = false;
   readonly god = false;
-  readonly zone = 'The Brine Shore';
   readonly multiplayer = null;
   readonly villageGames = null;
   readonly dawnBoss = undefined;
-  readonly hud = partial({ dialogue: { unit: null, isOpen: false, typing: false } });
-  readonly audio = NOOP;
-  readonly follow = NOOP;
-  readonly camera = new THREE.PerspectiveCamera(55, 1, 0.1, 10);
-  readonly vfx: any;
-  readonly combat: Pick<Combat, 'damage' | 'heal' | 'kill'>;
-  /** Stand-in for Game.player where shared code still assumes one local player (see the doc). */
-  readonly player: any;
+  /** Any touch of these is recorded here: the simulation has no business with them since S1. */
+  readonly touched: string[] = [];
+  readonly hud = trap('hud', this.touched);
+  readonly vfx = trap('vfx', this.touched);
+  readonly audio = trap('audio', this.touched);
+  readonly follow = trap('follow', this.touched);
+  readonly camera = trap('camera', this.touched);
+  readonly player = trap('player', this.touched);
+  /** The simulation's way out. `onEvent` sees each event (tests record them). */
+  readonly events = new SimEvents();
+  onEvent: ((e: SimEvent) => void) | null = null;
+  readonly timers = new SimTimers();
+  readonly projectiles = new Projectiles(this.events);
+  readonly combat = new Combat(this as never);
   boss: Boss | null = null;
   private readonly adds: Enemy[] = [];
-  private readonly projectiles: Projectile[] = [];
-  private readonly sharedCombat: Combat;
   private readonly clientOf = new Map<Unit, SimClient>();
   private readonly huntPoints: THREE.Vector3[] = [];
   private lastMech: string | null = null;
   private readonly rnd = mulberry32(7);
 
   constructor(readonly world: World, readonly scenario: Scenario) {
-    // A camera far above the map: canRespawnUnseen() then only checks for nearby players.
-    this.camera.position.set(0, 5000, 0);
-    this.camera.lookAt(0, 10000, 0);
-    this.camera.updateMatrixWorld(true);
-    this.vfx = partial({
-      // Ranged damage lands when the effect's homing orb arrives (vfx.projectile's onHit).
-      projectile: (from: THREE.Vector3, target: Unit, _style: string, speed: number, onHit: () => void) => {
-        this.stats.projectiles++;
-        this.projectiles.push({ x: from.x, y: from.y, z: from.z, target, speed, t: 0, onHit });
-      },
-    });
-    this.sharedCombat = new Combat(this as never);
-    const game = this;
-    this.combat = {
-      damage(src: Unit | null, dst: Unit, amount: number, o?: HitOptions) {
-        game.stats.damageEvents++;
-        return game.combatFor(src, dst).damage(src, dst, amount, o);
-      },
-      heal(src: Unit | null, dst: Unit, amount: number, crit?: boolean) {
-        return game.combatFor(src, dst).heal(src, dst, amount, crit);
-      },
-      kill(dst: Unit, src: Unit | null) {
-        return game.combatFor(src, dst).kill(dst, src);
-      },
-    };
-    this.player = {
-      get unit() {
-        return game.clients[0]?.unit;
-      },
-      onDamaged() {},
-      gainRage() {},
-      onWardHit() {},
-      /** Enemies ask the local player for sight; here it is sight from the enemy's own target. */
-      lineOfSight(t: Unit) {
-        const p = game.combatTarget(t);
-        const from = tv1.set(p.pos.x, p.pos.y + p.height * 0.8, p.pos.z);
-        const to = t.centre(tv2);
-        const hit = game.world.raycastSolid(from, to);
-        return hit === null || hit >= from.distanceTo(to) - t.radius - 0.3;
-      },
+    this.events.sink = (e) => {
+      if (e.type === 'damage') this.stats.damageEvents++;
+      else if (e.type === 'projectile' && e.stage === 'spawn') this.stats.projectiles++;
+      this.onEvent?.(e);
     };
   }
 
-  /** Player-dealt hits run in the attacker's view, hits on a player in the victim's (rage, pushback, wards). */
-  private combatFor(src: Unit | null, dst: Unit): Combat {
-    return (dst && this.clientOf.get(dst)?.combat) || (src && this.clientOf.get(src)?.combat) || this.sharedCombat;
+  clientOfUnit(u: Unit): SimClient | undefined {
+    return this.clientOf.get(u);
+  }
+
+  /** Direction from the town toward the open sea (where a freed crab walks). */
+  seaDirection(): THREE.Vector3 {
+    const a = this.world.pois.spawn.position;
+    const b = this.world.pois.wreck.position;
+    return new THREE.Vector3(b.x - a.x, 0, b.z - a.z).normalize();
   }
 
   get partyLevel(): number {
@@ -397,28 +372,56 @@ export class SimGame {
     }
 
     for (let i = 0; i < players; i++) {
-      const c = new SimClient(i);
-      const classId = CLASS_ORDER[i % CLASS_ORDER.length];
-      const spec: CrabSpec = { race: RACE_ORDER[i % RACE_ORDER.length], sex: i % 2 ? 'female' : 'male', classId, shell: i % 4, crest: i % 4, led: i % 4, name: `Bot${i}` };
-      const u = this.addUnit(spec.name, 'player', 'player', spec);
-      // One Game per player: Player reads input, camera and "the" player from it.
-      const view = Object.create(this) as Record<string, unknown>;
-      view.input = c.input;
-      view.follow = c.follow;
-      view.quests = c.quests;
-      c.player = new Player(view as never, u, CLASSES[classId]);
-      view.player = c.player;
-      c.combat = new Combat(view as never);
-      c.player.restoreXp(xpForLevel(level));
-      c.quests.accept('q1');
-      this.clientOf.set(u, c);
-      this.clients.push(c);
+      const c = this.addPlayer(CLASS_ORDER[i % CLASS_ORDER.length], level);
+      const u = c.unit;
       const towns = [w.pois.spawn, w.pois.forge, w.pois.chapel, w.pois.tavern, w.pois.grove];
       if (this.scenario === 'spread' && i % 5 < 2) c.home = towns[i % towns.length].position;
       const at = arena ? this.landNear(arena.position, 9) : c.home ? this.landNear(c.home, 12) : this.landNear(this.huntPoints[i % this.huntPoints.length], 10);
       u.teleport(w, at.x, at.z, this.rnd() * Math.PI * 2);
     }
     if (this.boss) this.boss.wake();
+  }
+
+  /** A simulated player at the world's spawn (move it with unit.teleport). */
+  addPlayer(classId: ClassId, level = 1): SimClient {
+    const i = this.clients.length;
+    const c = new SimClient(i);
+    const spec: CrabSpec = { race: RACE_ORDER[i % RACE_ORDER.length], sex: i % 2 ? 'female' : 'male', classId, shell: i % 4, crest: i % 4, led: i % 4, name: `Bot${i}` };
+    const u = this.addUnit(spec.name, 'player', 'player', spec);
+    // A Game view per player only for its keyboard and camera, which Player still reads (S2 splits it).
+    const view = Object.create(this) as Record<string, unknown>;
+    view.input = c.input;
+    view.follow = c.follow;
+    view.quests = c.quests;
+    c.player = new Player(view as never, u, CLASSES[classId]);
+    c.player.restoreXp(xpForLevel(level));
+    c.quests.accept('q1');
+    this.clientOf.set(u, c);
+    this.clients.push(c);
+    const sp = this.world.pois.spawn.position;
+    u.teleport(this.world, sp.x, sp.z, 0);
+    return c;
+  }
+
+  /** An enemy with its home at x, z (alone in its pack). */
+  addEnemy(kind: EnemyKind, x: number, z: number, wander = 0): Enemy {
+    const spec: CrabSpec = { race: 'human', sex: 'male', classId: 'warrior', shell: 0, crest: 0, led: 0, name: kind };
+    const u = this.addUnit(ENEMY_STATS[kind].name, kind, 'hostile', spec);
+    u.teleport(this.world, x, z, 0);
+    const e = new Enemy(this as never, u, kind, new THREE.Vector3(x, this.world.heightAt(x, z), z), wander);
+    e.pack = [e];
+    this.enemies.push(e);
+    return e;
+  }
+
+  /** A boss of `profile` with its arena at x, z (asleep; call wake()). */
+  addBoss(profile = BOSS_PROFILES.rust, x = 0, z = 0, radius = 12): Boss {
+    const spec: CrabSpec = { race: 'human', sex: 'male', classId: 'warrior', shell: 0, crest: 0, led: 0, name: 'Boss' };
+    const arena: Poi = { id: 'bossArena', position: new THREE.Vector3(x, this.world.heightAt(x, z), z), yaw: 0, radius };
+    const bu = this.addUnit(profile.name, 'boss', 'hostile', spec);
+    const fu = this.addUnit('Little Red', 'freed', 'friendly', spec);
+    this.boss = new Boss(this as never, bu, arena, fu, profile);
+    return this.boss;
   }
 
   // ---------------------------------------------------------------- outcomes (Game.onUnitDied)
@@ -457,9 +460,10 @@ export class SimGame {
 
   // ---------------------------------------------------------------- one tick
 
-  tick(dt: number): void {
+  tick(dt: number, bots = true): void {
     this.time += dt;
-    for (const c of this.clients) this.think(c);
+    this.timers.update(this.time);
+    if (bots) for (const c of this.clients) this.think(c);
     for (const c of this.clients) c.player.update(dt);
     for (const e of this.enemies) e.update(dt);
     if (this.boss) {
@@ -475,9 +479,9 @@ export class SimGame {
     this.separate();
     for (const u of this.units) if (u.rustUntil && this.time >= u.rustUntil) u.rust = u.rustUntil = 0;
     for (const c of this.clients) if (!c.unit.alive && c.deadUntil >= 0 && this.time >= c.deadUntil) this.respawn(c);
-    this.updateProjectiles(dt);
-    // Pending swings land from Unit.updateVisual (the clip's hit moment); it must run on a server too.
-    for (const u of this.units) u.updateVisual(dt);
+    // The game clock lands pending swings and flies projectiles (Game.frame does the same).
+    for (const u of this.units) u.updateHit(dt);
+    this.projectiles.update(dt);
   }
 
   private respawn(c: SimClient): void {
@@ -486,27 +490,6 @@ export class SimGame {
     const home = this.boss ? this.boss.arena.position : this.huntPoints[c.index % this.huntPoints.length];
     const at = this.landNear(home, 10);
     c.unit.teleport(this.world, at.x, at.z);
-  }
-
-  private updateProjectiles(dt: number): void {
-    for (let i = this.projectiles.length - 1; i >= 0; i--) {
-      const p = this.projectiles[i];
-      p.t += dt;
-      const dest = p.target.centre(tv1);
-      const dx = dest.x - p.x;
-      const dy = dest.y - p.y;
-      const dz = dest.z - p.z;
-      const len = Math.hypot(dx, dy, dz);
-      const step = p.speed * dt;
-      if (len <= step || !p.target.alive || p.t >= 6) {
-        this.projectiles.splice(i, 1);
-        p.onHit();
-        continue;
-      }
-      p.x += (dx / len) * step;
-      p.y += (dy / len) * step;
-      p.z += (dz / len) * step;
-    }
   }
 
   /** Game.separate(): keep crabs from standing inside each other. */

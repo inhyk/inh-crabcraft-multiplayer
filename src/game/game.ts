@@ -30,6 +30,9 @@ import { Hud } from '../ui/hud/hud';
 import type { QuestMark } from '../ui/hud/plates';
 import { Boss } from './boss';
 import { BossJourney } from './bossJourney';
+import { BrowserSink } from './browserSink';
+import { SimEvents, SimTimers } from './events';
+import { Projectiles } from './projectiles';
 import { BOSS_PROFILES } from './progression';
 import { Combat } from './combat';
 import { DebugTools } from './debug';
@@ -88,6 +91,12 @@ const v2 = new THREE.Vector3();
 export class Game {
   readonly scene = new THREE.Scene();
   readonly camera = new THREE.PerspectiveCamera(55, 1, 0.1, 2000);
+  /** Everything the simulation shows or plays goes out here; `sink` turns it into HUD, effects and sound. */
+  readonly events = new SimEvents();
+  /** Timers on the game clock (they wait while the game is paused). */
+  readonly timers = new SimTimers();
+  readonly projectiles = new Projectiles(this.events);
+  readonly sink = new BrowserSink(this);
   readonly combat: Combat;
   readonly quests = new QuestLog();
   readonly ending: EndingSequence;
@@ -152,6 +161,7 @@ export class Game {
   multiplayer: Multiplayer | null = null;
 
   constructor(readonly app: App) {
+    this.events.sink = this.sink.handle;
     this.combat = new Combat(this);
     this.ending = new EndingSequence(this);
   }
@@ -164,6 +174,11 @@ export class Game {
   }
   get audio() {
     return this.app.audio;
+  }
+
+  /** The crab the player is talking to (the dialogue window's), which the player's crab turns to. */
+  get talkPartner(): Unit | null {
+    return this.hud?.dialogue.unit ?? null;
   }
 
   /** Movement, abilities and targeting are off (dead, cutscene, menu). */
@@ -604,12 +619,15 @@ export class Game {
     const dt = f.dt;
     const paused = (this.hud.menu.open||this.app.account.open) && !this.multiplayer?.battle.active;
     this.handleInput();
+    const authority = this.multiplayer?.battle.authority !== false;
     if (!paused) {
       this.time += dt;
+      this.timers.update(this.time);
       this.player.update(dt);
-      if (this.multiplayer?.battle.authority !== false) {
+      const bosses = this.world2.chapter===1 ? [this.boss,this.finalBoss] : this.world2.chapter===2 ? [this.worldBoss] : [this.dawnBoss];
+      if (authority) {
         for (const e of this.enemies) e.update(dt);
-        if(this.world2.chapter===1){this.boss.update(dt);this.finalBoss.update(dt);}else if(this.world2.chapter===2)this.worldBoss.update(dt);else this.dawnBoss.update(dt);
+        for (const b of bosses) b.update(dt);
       }
       this.journey?.update(dt);
       for (const n of this.npcs) n.update(dt); if(this.multiplayer?.battle.authority!==false)for (const t of this.townsfolk) if(!this.villageGames?.ownsNpc(t.unit))t.update(dt);
@@ -617,12 +635,18 @@ export class Game {
       this.ending.update(dt);
       this.updateDeath();
       this.updateStatuses();
+      this.sink.drawState(bosses, authority);
     }
     this.multiplayer?.update(dt);
     this.villageGames?.update(paused?0:dt);
     this.boats?.update(paused?0:dt);
     this.achievements?.update(paused?0:dt);
     this.voyageIsland?.update();
+    if (!paused) {
+      // The game clock lands pending swings and flies projectiles, on screen or not.
+      for (const u of this.units) u.updateHit(dt);
+      this.projectiles.update(dt);
+    }
     // Visual updates (culled when far away, simplified when small on screen)
     const cam = this.camera.position;
     // Screen pixels per world unit at distance 1 (CSS pixels, so Retina does not change the LOD).
@@ -1126,14 +1150,14 @@ export class Game {
     this.vfx.mendGlow(this.player.unit);
     this.hud.chat.system(t('실버문 여사의 달샘 축복을 받았어요. 전투 중에도 껍질이 천천히 회복됩니다.','Lady Silvermoon blesses you with moonwater. Your shell slowly mends while you fight.'));
     this.quests.accept('q4');
-    setTimeout(() => {
+    this.timers.at(this.time + 2.6, () => {
       // The player may have switched off the lighthouse or left the shore in the meantime.
       if (!this.alive||this.world2.chapter!==1||!this.beaconLit||this.journey?.rustCleared) return;
       this.boss.wake();
       this.audio.sfx('sfx-boss-roar');
       this.follow.shake(0.3, 1.2);
       this.hud.messages.warn(t('철의 난파선에서 코로디우스가 깨어납니다!','Corrodius stirs on the Iron Wreck!'));
-    }, 2600);
+    });
   }
 
   questMark(u: Unit): QuestMark {
@@ -1222,13 +1246,12 @@ export class Game {
       // Save the consumed personal blessing with the boss victory, before any reload.
       this.player.unit.blessingUntil = 0;
       this.journey?.onBossDefeated(boss);
-      setTimeout(() => {
+      this.timers.at(this.time + 1.8, () => {
         if (!this.alive) return;
         if (boss === this.boss) this.quests.bump('boss');
-        this.hud.messages.banner(() => (t('승리 · 왕관 획득','VICTORY · Crown reclaimed')),() => (boss.profile.name), 'boss');
-        this.vfx.levelUp(this.player.unit);
-      }, 1800);
-      setTimeout(() => this.alive && this.hud.bossFrame.hide(), 5000);
+        this.events.emit({ type: 'victory', boss: u, stage: 'banner' });
+      });
+      this.timers.at(this.time + 5, () => this.alive && this.events.emit({ type: 'victory', boss: u, stage: 'end' }));
     }
   }
 
@@ -1241,14 +1264,11 @@ export class Game {
       return;
     }
     this.cogMisses = 0;
-    setTimeout(() => {
+    this.timers.at(this.time + 0.45, () => {
       if (!this.alive) return;
-      this.vfx.lootSparkle(u.pos);
-      this.hud.floats.spawn(u, '+1 Rusted Cog', 'info');
-      this.hud.chat.loot('You receive loot: [Rusted Cog].');
-      this.audio.sfx('sfx-click', { volume: 0.6 });
+      this.events.emit({ type: 'loot', unit: u, item: 'cog' });
       this.quests.bump('collect-cog');
-    }, 450);
+    });
   }
 
   private playerDied(): void {
